@@ -22,8 +22,22 @@ from config import PROCESSED_DATA_DIR, RAW_DATA_DIR
 
 logger = logging.getLogger(__name__)
 
-GAMMA_API = "https://gamma-api.polymarket.com"
-CLOB_API = "https://clob.polymarket.com"
+# ── Proxy Configuration ──────────────────────────────────────────
+# Set PROXY_URL to your Cloudflare Worker URL to bypass ISP blocking.
+# Leave empty to use direct Polymarket APIs (requires VPN/DNS in blocked regions).
+#
+# Deploy your own proxy: see cloudflare_worker/README.md
+# Example: PROXY_URL = "https://polymarket-proxy.your-subdomain.workers.dev"
+PROXY_URL = ""  # <-- Set your worker URL here
+
+# API endpoints (routed through proxy if PROXY_URL is set)
+if PROXY_URL:
+    GAMMA_API = f"{PROXY_URL}/gamma"
+    CLOB_API = f"{PROXY_URL}/clob"
+    logger.info(f"Using proxy: {PROXY_URL}")
+else:
+    GAMMA_API = "https://gamma-api.polymarket.com"
+    CLOB_API = "https://clob.polymarket.com"
 MONTHS = ["january", "february", "march", "april", "may", "june",
           "july", "august", "september", "october", "november", "december"]
 

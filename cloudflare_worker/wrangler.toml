@@ -1,0 +1,16 @@
+name = "polymarket-proxy"
+main = "worker.js"
+compatibility_date = "2024-09-01"
+
+# Deployment: Run `npx wrangler deploy` from this directory
+# First time: `npx wrangler login` to authenticate
+# 
+# After deploy, your worker URL will be:
+#   https://polymarket-proxy.<your-subdomain>.workers.dev
+#
+# Usage in polymarket_scraper.py:
+#   Set PROXY_URL = "https://polymarket-proxy.<your-subdomain>.workers.dev"
+
+[vars]
+# Optional: Add a secret token for extra security
+# PROXY_TOKEN = "your-secret-token-here"
