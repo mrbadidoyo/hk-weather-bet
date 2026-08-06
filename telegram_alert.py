@@ -396,26 +396,201 @@ def format_message(target_date, predictions, market_prices, actual_temps):
 
     lines.append("")
     
-    # Best value bets (only if not resolved)
+    # RECOMMENDED BETS (only if not resolved)
+    best_bets = {"high": {"main": None, "lottery": None}, "low": {"main": None, "lottery": None}}
     if not is_resolved:
-        lines.append("💰 *VALUE BETS (edge >5%):*")
-        best_bets = find_best_bets(predictions, market_prices, date_str)
-        if best_bets:
-            for bet in best_bets[:5]:
+        best_bets = find_recommended_bets(predictions, market_prices, date_str)
+        
+        lines.append("🎯 *RECOMMENDED BETS:*")
+        lines.append("")
+        
+        # HIGH recommendations
+        lines.append("  🔴 *HIGH:*")
+        if best_bets["high"]["main"]:
+            b = best_bets["high"]["main"]
+            # Check if main bet is underpriced
+            if b["edge"] > 0:
+                lines.append(f"     📌 Main: {b['bucket']} @ {b['market']:.0%} 💎")
+                lines.append(f"        Model: {b['model']:.0%} | Edge: {b['edge']:+.1%} | UNDERPRICED!")
+            else:
+                lines.append(f"     📌 Main: {b['bucket']} @ {b['market']:.0%}")
+                lines.append(f"        Model: {b['model']:.0%} | Edge: {b['edge']:+.1%}")
+        else:
+            lines.append("     📌 Main: No suitable bet")
+        
+        if best_bets["high"]["lottery"]:
+            b = best_bets["high"]["lottery"]
+            lines.append(f"     🎰 Lottery: {b['bucket']} @ {b['market']:.0%}")
+            lines.append(f"        Model: {b['model']:.0%} | Edge: {b['edge']:+.1%} | {b['confidence']}")
+        else:
+            lines.append("     🎰 Lottery: No value bet found")
+        
+        lines.append("")
+        
+        # LOW recommendations
+        lines.append("  🔵 *LOW:*")
+        if best_bets["low"]["main"]:
+            b = best_bets["low"]["main"]
+            # Check if main bet is underpriced
+            if b["edge"] > 0:
+                lines.append(f"     📌 Main: {b['bucket']} @ {b['market']:.0%} 💎")
+                lines.append(f"        Model: {b['model']:.0%} | Edge: {b['edge']:+.1%} | UNDERPRICED!")
+            else:
+                lines.append(f"     📌 Main: {b['bucket']} @ {b['market']:.0%}")
+                lines.append(f"        Model: {b['model']:.0%} | Edge: {b['edge']:+.1%}")
+        else:
+            lines.append("     📌 Main: No suitable bet")
+        
+        if best_bets["low"]["lottery"]:
+            b = best_bets["low"]["lottery"]
+            lines.append(f"     🎰 Lottery: {b['bucket']} @ {b['market']:.0%}")
+            lines.append(f"        Model: {b['model']:.0%} | Edge: {b['edge']:+.1%} | {b['confidence']}")
+        else:
+            lines.append("     🎰 Lottery: No value bet found")
+        
+        lines.append("")
+        lines.append("  _📌 Main = sesuai forecast | 🎰 Lottery = underpriced | 💎 = main also underpriced_")
+        lines.append("")
+
+    # Other value bets
+    if not is_resolved:
+        lines.append("💰 *Other Value Bets:*")
+        all_bets = find_best_bets(predictions, market_prices, date_str)
+        # Exclude the recommended bets
+        other_bets = []
+        for b in all_bets:
+            is_recommended = False
+            if best_bets["high"]["main"] and b["bucket"] == best_bets["high"]["main"]["bucket"] and b["type"] == "HIGH":
+                is_recommended = True
+            if best_bets["high"]["lottery"] and b["bucket"] == best_bets["high"]["lottery"]["bucket"] and b["type"] == "HIGH":
+                is_recommended = True
+            if best_bets["low"]["main"] and b["bucket"] == best_bets["low"]["main"]["bucket"] and b["type"] == "LOW":
+                is_recommended = True
+            if best_bets["low"]["lottery"] and b["bucket"] == best_bets["low"]["lottery"]["bucket"] and b["type"] == "LOW":
+                is_recommended = True
+            if not is_recommended:
+                other_bets.append(b)
+        
+        if other_bets:
+            for bet in other_bets[:4]:
                 lines.append(f"  {bet['emoji']} {bet['bucket']} — "
                             f"Model: {bet['model']:.0%} vs Market: {bet['market']:.0%} "
                             f"(Edge: {bet['edge']:+.1%})")
         else:
-            lines.append("  No strong value bets found.")
+            lines.append("  Tidak ada value bet lain.")
 
     lines.append("")
-    lines.append("_✅ = edge >5% | 🏆 = winning bucket_")
+    lines.append("_🎯 = recommended | Edge = Model - Market_")
 
     return "\n".join(lines)
 
 
+def find_recommended_bets(predictions, market_prices, date_str):
+    """
+    Find 2 types of bets for HIGH and LOW:
+    1. MAIN BET = closest to HKO forecast, reasonable price
+    2. LOTTERY TICKET = underpriced value bet (edge > 10%, prob > 15%, market < 30%)
+    
+    Returns dict with 'high' and 'low' keys, each containing 'main' and 'lottery'.
+    """
+    results = {
+        "high": {"main": None, "lottery": None},
+        "low": {"main": None, "lottery": None}
+    }
+
+    forecast = predictions.get("forecast", {})
+    
+    for temp_type, prob_key, market_type, result_key, forecast_key in [
+        ("HIGH", "high_probs", "highest", "high", "max_temp"),
+        ("LOW", "low_probs", "lowest", "low", "min_temp"),
+    ]:
+        probs = predictions.get(prob_key, {})
+        market_key = f"{date_str}_{market_type}"
+        market = market_prices.get(market_key, {}).get("prices", {})
+        forecast_temp = forecast.get(forecast_key)
+        
+        # Find MAIN BET: bucket with highest probability that's close to forecast
+        main_candidates = []
+        for bucket, model_prob in probs.items():
+            # Extract temperature from bucket name
+            import re
+            match = re.search(r'(\d+)', bucket)
+            if match:
+                bucket_temp = int(match.group(1))
+                # Find market price
+                market_price = None
+                for mk, mp in market.items():
+                    if bucket.split("°")[0] in mk or mk.split("°")[0] in bucket:
+                        market_price = mp
+                        break
+                
+                if market_price is not None and model_prob > 0.10:
+                    # Score: probability * closeness to forecast
+                    if forecast_temp:
+                        distance = abs(bucket_temp - forecast_temp)
+                        # Prefer buckets within 1-2 degrees of forecast
+                        closeness_score = max(0, 1 - distance * 0.3)
+                    else:
+                        closeness_score = 0.5
+                    
+                    score = model_prob * (0.5 + 0.5 * closeness_score)
+                    main_candidates.append({
+                        "type": temp_type,
+                        "bucket": bucket,
+                        "model": model_prob,
+                        "market": market_price,
+                        "edge": model_prob - market_price,
+                        "score": score,
+                        "emoji": "🔴" if temp_type == "HIGH" else "🔵",
+                        "temp": bucket_temp,
+                    })
+        
+        if main_candidates:
+            main_candidates.sort(key=lambda x: x["score"], reverse=True)
+            best_main = main_candidates[0]
+            best_main["confidence"] = "MAIN"
+            results[result_key]["main"] = best_main
+        
+        # Find LOTTERY TICKET: underpriced value bet
+        lottery_candidates = []
+        for bucket, model_prob in probs.items():
+            for mk, mp in market.items():
+                if bucket.split("°")[0] in mk or mk.split("°")[0] in bucket:
+                    edge = model_prob - mp
+                    
+                    # Apply lottery criteria: high edge, reasonable prob, cheap
+                    if edge > 0.10 and model_prob > 0.15 and mp < 0.30:
+                        score = edge * model_prob
+                        lottery_candidates.append({
+                            "type": temp_type,
+                            "bucket": bucket,
+                            "model": model_prob,
+                            "market": mp,
+                            "edge": edge,
+                            "score": score,
+                            "emoji": "🔴" if temp_type == "HIGH" else "🔵",
+                        })
+                    break
+        
+        if lottery_candidates:
+            lottery_candidates.sort(key=lambda x: x["score"], reverse=True)
+            best_lottery = lottery_candidates[0]
+            
+            # Add confidence label
+            if best_lottery["edge"] > 0.20 and best_lottery["model"] > 0.25:
+                best_lottery["confidence"] = "HIGH"
+            elif best_lottery["edge"] > 0.15:
+                best_lottery["confidence"] = "MEDIUM"
+            else:
+                best_lottery["confidence"] = "LOW"
+            
+            results[result_key]["lottery"] = best_lottery
+
+    return results
+
+
 def find_best_bets(predictions, market_prices, date_str):
-    """Find bets where model probability > market price by significant margin."""
+    """Find all bets where model probability > market price (edge > 5%)."""
     bets = []
 
     for temp_type, prob_key, market_type in [
