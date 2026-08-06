@@ -15,6 +15,7 @@ data/processed/*.csv
 data/processed/*.pkl
 data/processed/*.joblib
 data/processed/*.jsonl
+data/processed/bias_corrections.jsonl
 !data/processed/.gitkeep
 
 # Models (too large)

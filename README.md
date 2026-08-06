@@ -27,6 +27,8 @@ Resolution source: HKO "Absolute Daily Max/Min" dari [Daily Extract](https://www
 - **Kelly Criterion**: Optimal bet sizing with quarter-Kelly (0.25 fraction), capped at 10% bankroll
 - **Model Performance Tracking**: JSONL log of predictions vs outcomes, Brier score, win rate, ROI
 - **Ensemble NWP Integration**: 80 members (50 ECMWF + 30 GFS) blended 60% HKO + 40% NWP
+- **Multi-Day Bias Correction**: EWMA-based learning from prediction errors, auto-corrects forecast drift
+- **Bankroll Dashboard**: P&L tracking, prediction history, bias visualization, Kelly reference table
 
 ## Project Structure
 
@@ -40,6 +42,7 @@ hk_weather_bet/
 ├── polymarket_scraper.py  # Polymarket price scraper
 ├── telegram_alert.py      # Hourly Telegram prediction alerts (v2)
 ├── model_tracker.py       # Model performance tracking
+├── bias_corrector.py      # Multi-day bias correction (EWMA)
 ├── app.py                 # Streamlit GUI
 ├── nwp_collector.py       # Open-Meteo ensemble collector
 ├── data/

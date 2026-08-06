@@ -29,6 +29,7 @@ from config import (
 from data_collector import HKODataCollector
 from polymarket_scraper import PolymarketScraper
 from model_tracker import log_prediction, update_prediction, get_performance_stats
+from bias_corrector import log_forecast_error, get_bias_correction, format_bias_summary
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -672,6 +673,17 @@ def format_message(target_date, predictions, market_prices, actual_temps):
 
     lines.append("")
     lines.append("_🎯 = recommended | Edge = Model - Market_")
+    
+    # Add bias correction summary
+    from bias_corrector import get_bias_report
+    bias_report = get_bias_report()
+    bias_parts = []
+    for ttype in ["high", "low"]:
+        b = bias_report[ttype]
+        if b["n_samples"] > 0:
+            bias_parts.append(f"{ttype.upper()}: {b['correction']:+.2f}°C")
+    if bias_parts:
+        lines.append(f"_Bias correction: {' | '.join(bias_parts)} (n={bias_report['high']['n_samples']+bias_report['low']['n_samples']})_")
 
     return "\n".join(lines)
 
@@ -898,6 +910,10 @@ def run():
             update_prediction(date_str, "high", actual_max)
         if actual_min is not None:
             update_prediction(date_str, "low", actual_min)
+        
+        # Improvement #6: Log forecast errors for bias correction
+        # We need yesterday's prediction mean to compute the error
+        # Use the blended forecast from the prediction
     else:
         print(f"  Event not yet resolved")
 
@@ -942,6 +958,19 @@ def run():
         min_fc = None
         print(f"  No forecast available for {date_str}")
 
+    # Improvement #6: Apply bias correction from recent errors
+    print("\n  Applying bias correction...")
+    bias_high = get_bias_correction("high")
+    bias_low = get_bias_correction("low")
+    if max_fc is not None and bias_high["n_samples"] > 0:
+        max_fc += bias_high["correction"]
+        print(f"  HIGH correction: {bias_high['correction']:+.2f}°C (n={bias_high['n_samples']}, {bias_high['confidence']})")
+    if min_fc is not None and bias_low["n_samples"] > 0:
+        min_fc += bias_low["correction"]
+        print(f"  LOW correction: {bias_low['correction']:+.2f}°C (n={bias_low['n_samples']}, {bias_low['confidence']})")
+    if bias_high["n_samples"] == 0 and bias_low["n_samples"] == 0:
+        print("  No bias data yet (will start learning after first resolved event)")
+    
     # Predict high temp buckets using dynamic bucket definitions
     high_probs, high_mean, high_std = predict_buckets(
         'max', recent, target_date, forecast_temp=max_fc, bucket_defs=high_bucket_defs
@@ -976,6 +1005,12 @@ def run():
         log_prediction(date_str, "high", high_probs, best_bets.get("high", {}))
         log_prediction(date_str, "low", low_probs, best_bets.get("low", {}))
         print("\n  [OK] Predictions logged for performance tracking")
+    
+    # Improvement #6: Log forecast errors for resolved events (bias learning)
+    if actual_max is not None:
+        log_forecast_error(date_str, "high", high_mean, actual_max)
+        log_forecast_error(date_str, "low", low_mean, actual_min)
+        print("  [OK] Forecast errors logged for bias correction")
 
     try:
         print(f"\n--- Message Preview ---")

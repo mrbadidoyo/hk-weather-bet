@@ -117,6 +117,7 @@ with st.sidebar:
     page = st.radio("Navigate", [
         "Dashboard",
         "Betting Analysis",
+        "Bankroll",
         "Backtest",
         "Historical Data",
         "Model Training",
@@ -484,6 +485,142 @@ elif page == "Betting Analysis":
                        delta=f"{low_analysis.best_bet.edge:+.1%} edge")
         else:
             st.metric("Low Temp", "No +EV bets")
+
+
+# ====================================================================
+# PAGE: Bankroll Management
+# ====================================================================
+elif page == "Bankroll":
+    st.markdown("# Bankroll Management")
+    st.caption("Track P&L, model performance, and bias corrections")
+
+    from model_tracker import get_performance_stats, PERFORMANCE_LOG
+    from bias_corrector import get_bias_report, BIAS_LOG
+
+    # ── Performance Stats ──────────────────────────────────────────
+    st.markdown("## Model Performance")
+
+    period = st.selectbox("Period", [7, 14, 30, 90], format_func=lambda x: f"Last {x} days", index=2)
+    stats = get_performance_stats(days=period)
+
+    if stats:
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Brier Score", f"{stats['brier_score']:.3f}" if stats['brier_score'] else "N/A",
+                  help="Lower is better. 0=perfect, 0.25=no skill")
+        c2.metric("Win Rate", f"{stats['win_rate']:.1%}" if stats['win_rate'] else "N/A")
+        c3.metric("ROI", f"{stats['roi']:+.1%}" if stats['roi'] is not None else "N/A")
+        c4.metric("Total Bets", stats['total_bets'])
+        c5.metric("Resolved Days", stats['resolved_days'])
+    else:
+        st.info("No performance data yet. Predictions will be tracked after the first Telegram alert run.")
+
+    st.divider()
+
+    # ── Prediction Log ─────────────────────────────────────────────
+    st.markdown("## Prediction History")
+
+    if PERFORMANCE_LOG.exists():
+        import json as _json
+        entries = []
+        for line in PERFORMANCE_LOG.read_text(encoding="utf-8").strip().split("\n"):
+            if line.strip():
+                entries.append(_json.loads(line))
+
+        if entries:
+            # Build table
+            log_rows = []
+            for e in entries[-30:]:  # Last 30 entries
+                bets = e.get("recommended_bets", {})
+                main_bucket = bets.get("main", {}).get("bucket", "-") if bets.get("main") else "-"
+                main_prob = f"{bets.get('main', {}).get('model', 0):.0%}" if bets.get("main") else "-"
+                main_edge = f"{bets.get('main', {}).get('edge', 0):+.1%}" if bets.get("main") else "-"
+                lottery_bucket = bets.get("lottery", {}).get("bucket", "-") if bets.get("lottery") else "-"
+                
+                status = "Resolved" if e.get("resolved") else "Pending"
+                actual = f"{e.get('actual_temp', '?')}\u00b0C" if e.get("actual_temp") is not None else "-"
+
+                log_rows.append({
+                    "Date": e["target_date"],
+                    "Type": e["temp_type"].upper(),
+                    "Main Bet": main_bucket,
+                    "Model Prob": main_prob,
+                    "Edge": main_edge,
+                    "Lottery": lottery_bucket,
+                    "Actual": actual,
+                    "Status": status,
+                })
+
+            st.dataframe(pd.DataFrame(log_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No predictions logged yet.")
+    else:
+        st.info("No prediction log file found. Run telegram_alert.py to start tracking.")
+
+    st.divider()
+
+    # ── Bias Correction ────────────────────────────────────────────
+    st.markdown("## Bias Correction (Multi-Day Learning)")
+    st.caption("Tracks if model consistently over/under-predicts and applies corrections")
+
+    bias_report = get_bias_report()
+
+    bc1, bc2 = st.columns(2)
+    for col, temp_type in [(bc1, "high"), (bc2, "low")]:
+        with col:
+            b = bias_report[temp_type]
+            label = "HIGH Temperature" if temp_type == "high" else "LOW Temperature"
+            st.markdown(f"### {label}")
+
+            if b["n_samples"] == 0:
+                st.info("No bias data yet. Will start learning after first resolved event.")
+            else:
+                direction_emoji = "\u2b06\ufe0f" if b["mean_error"] > 0 else "\u2b07\ufe0f" if b["mean_error"] < 0 else "\u2705"
+                c_b1, c_b2, c_b3 = st.columns(3)
+                c_b1.metric("Direction", f"{direction_emoji} {b['direction']}")
+                c_b2.metric("Mean Error", f"{b['mean_error']:+.2f}\u00b0C")
+                c_b3.metric("Correction", f"{b['correction']:+.2f}\u00b0C")
+
+                st.caption(f"Samples: {b['n_samples']} | EWMA: {b['ewma_error']:+.2f}\u00b0C | Confidence: {b['confidence']}")
+
+                # Visual indicator
+                if abs(b["correction"]) > 1.0:
+                    st.warning("Large bias detected — model may need recalibration")
+                elif abs(b["correction"]) > 0.5:
+                    st.info("Moderate bias — correction being applied")
+                else:
+                    st.success("Model well-calibrated")
+
+    st.divider()
+
+    # ── Kelly Sizing Reference ─────────────────────────────────────
+    st.markdown("## Kelly Criterion Reference")
+    st.caption("Optimal bet sizing based on edge and probability")
+
+    bankroll = st.number_input("Current bankroll ($)", value=100.0, step=10.0, min_value=1.0)
+
+    kelly_rows = []
+    for prob in [0.20, 0.30, 0.40, 0.50, 0.60]:
+        for market_price in [0.10, 0.15, 0.20, 0.25, 0.30]:
+            odds = 1.0 / market_price
+            b = odds - 1
+            p = prob
+            q = 1 - p
+            kelly_pct = (b * p - q) / b
+            if kelly_pct > 0:
+                stake = bankroll * kelly_pct * 0.25  # Quarter-Kelly
+                stake = min(stake, bankroll * 0.10)  # Cap at 10%
+                kelly_rows.append({
+                    "Model Prob": f"{prob:.0%}",
+                    "Market Price": f"${market_price:.2f}",
+                    "Edge": f"{prob - market_price:+.1%}",
+                    "Kelly %": f"{kelly_pct:.1%}",
+                    "Stake": f"${stake:.2f}",
+                })
+
+    if kelly_rows:
+        st.dataframe(pd.DataFrame(kelly_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No +EV scenarios at current bankroll level.")
 
 
 # ====================================================================
