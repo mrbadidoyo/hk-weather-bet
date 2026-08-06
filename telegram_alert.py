@@ -1,6 +1,12 @@
 """
 Telegram Prediction Alert — Runs hourly, monitors tomorrow's HK temperature event.
 Sends predictions vs Polymarket prices until event is resolved.
+
+Improvements v2:
+- Dynamic bucket ranges from Polymarket
+- Kelly Criterion for bet sizing
+- Model performance tracking
+- Ensemble NWP integration
 """
 import sys
 import io
@@ -22,6 +28,7 @@ from config import (
 )
 from data_collector import HKODataCollector
 from polymarket_scraper import PolymarketScraper
+from model_tracker import log_prediction, update_prediction, get_performance_stats
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -29,6 +36,10 @@ logger = logging.getLogger(__name__)
 # Telegram config
 TELEGRAM_BOT_TOKEN = "8909269274:AAF5XoUwEh9zZXekHniWFVVwUTijEn9Vz-4"
 TELEGRAM_CHAT_ID = "225257336"
+
+# Bankroll config for Kelly Criterion
+BANKROLL = 100.0  # Starting bankroll in USD
+KELLY_FRACTION = 0.25  # Quarter-Kelly for safety
 
 
 # ── Data Fetching ────────────────────────────────────────────────
@@ -151,12 +162,20 @@ def get_actual_temperature(target_date):
 
 # ── Prediction Engine ────────────────────────────────────────────
 
-def predict_buckets(temp_type, recent_data, target_date, forecast_temp=None):
+def predict_buckets(temp_type, recent_data, target_date, forecast_temp=None, bucket_defs=None):
     """
     Predict bucket probabilities for target_date using historical distribution + forecast.
+    
+    Args:
+        temp_type: 'max' or 'min'
+        recent_data: DataFrame with historical temperature data
+        target_date: Date to predict
+        forecast_temp: Optional forecast temperature for blending
+        bucket_defs: Optional list of (label, lo, hi) tuples. If None, uses defaults.
     """
     col = f'{temp_type}_temp'
-    bucket_defs = DEFAULT_HIGH_TEMP_BUCKETS if temp_type == 'max' else DEFAULT_LOW_TEMP_BUCKETS
+    if bucket_defs is None:
+        bucket_defs = DEFAULT_HIGH_TEMP_BUCKETS if temp_type == 'max' else DEFAULT_LOW_TEMP_BUCKETS
 
     # Historical same-day stats (±5 days window)
     doy = target_date.timetuple().tm_yday
@@ -288,6 +307,165 @@ def check_if_resolved(market_prices, date_str):
     return False, None
 
 
+# ── Improvement #1: Dynamic Bucket Ranges ────────────────────────
+
+def extract_dynamic_buckets(market_prices, date_str, temp_type):
+    """
+    Extract actual bucket definitions from Polymarket market data.
+    Buckets shift per day based on expected temperatures.
+    
+    Returns list of (label, lo, hi) tuples.
+    """
+    key = f"{date_str}_{temp_type}"
+    if key not in market_prices:
+        # Fallback to default buckets
+        return DEFAULT_HIGH_TEMP_BUCKETS if temp_type == "highest" else DEFAULT_LOW_TEMP_BUCKETS
+    
+    prices = market_prices[key]["prices"]
+    buckets = []
+    
+    for bucket_label in prices.keys():
+        # Parse bucket label like "34°C", "27°C or below", "37°C or higher"
+        match = re.search(r'(\d+)', bucket_label)
+        if not match:
+            continue
+        
+        temp = int(match.group(1))
+        
+        if "below" in bucket_label.lower():
+            # "27°C or below" → (-999, 28)
+            buckets.append((bucket_label, -999, temp + 1))
+        elif "higher" in bucket_label.lower():
+            # "37°C or higher" → (37, 999)
+            buckets.append((bucket_label, temp, 999))
+        else:
+            # "34°C" → (34, 35)
+            buckets.append((bucket_label, temp, temp + 1))
+    
+    # Sort by lower bound
+    buckets.sort(key=lambda x: x[1])
+    
+    return buckets if buckets else (DEFAULT_HIGH_TEMP_BUCKETS if temp_type == "highest" else DEFAULT_LOW_TEMP_BUCKETS)
+
+
+# ── Improvement #3: Kelly Criterion ──────────────────────────────
+
+def calculate_kelly_stake(prob, odds, bankroll=BANKROLL, kelly_frac=KELLY_FRACTION):
+    """
+    Calculate optimal bet size using Kelly Criterion.
+    
+    Args:
+        prob: Model's estimated probability of winning
+        odds: Decimal odds (1 / market_price)
+        bankroll: Current bankroll
+        kelly_frac: Fraction of Kelly to use (0.25 = quarter-Kelly for safety)
+    
+    Returns:
+        Recommended stake amount
+    """
+    if prob <= 0 or odds <= 1:
+        return 0.0
+    
+    # Kelly formula: f = (bp - q) / b
+    # b = odds - 1 (net odds)
+    # p = win probability
+    # q = lose probability = 1 - p
+    b = odds - 1
+    p = prob
+    q = 1 - p
+    
+    kelly_pct = (b * p - q) / b
+    
+    # Only bet if edge is positive
+    if kelly_pct <= 0:
+        return 0.0
+    
+    # Apply fractional Kelly for safety
+    stake = bankroll * kelly_pct * kelly_frac
+    
+    # Cap at 10% of bankroll
+    stake = min(stake, bankroll * 0.10)
+    
+    return round(stake, 2)
+
+
+# ── Improvement #5: Ensemble NWP ─────────────────────────────────
+
+def get_ensemble_nwp_forecast(lat=22.3167, lon=114.1667):
+    """
+    Fetch ensemble NWP forecast from Open-Meteo.
+    Uses 80 ensemble members (50 ECMWF + 30 GFS) for uncertainty quantification.
+    
+    Returns dict with:
+    - mean_temp: Ensemble mean
+    - std_temp: Ensemble standard deviation (uncertainty)
+    - percentiles: {10, 25, 50, 75, 90}
+    - members: Raw ensemble values
+    """
+    try:
+        from nwp_collector import NWPCollector
+        collector = NWPCollector(lat=lat, lon=lon)
+        
+        # Fetch ensemble data
+        ensemble_data = collector.fetch_ensemble_forecast(forecast_days=3)
+        
+        if not ensemble_data:
+            return None
+        
+        # Extract tomorrow's temperatures
+        tomorrow = datetime.now().date() + timedelta(days=1)
+        tomorrow_str = tomorrow.isoformat()
+        
+        dates = ensemble_data.get("dates", [])
+        if tomorrow_str not in dates:
+            return None
+        
+        tomorrow_idx = dates.index(tomorrow_str)
+        
+        # Get ensemble members for tomorrow
+        members_max = ensemble_data.get("members_max", [])
+        members_min = ensemble_data.get("members_min", [])
+        
+        max_temps = [m[tomorrow_idx] for m in members_max if len(m) > tomorrow_idx and m[tomorrow_idx] is not None]
+        min_temps = [m[tomorrow_idx] for m in members_min if len(m) > tomorrow_idx and m[tomorrow_idx] is not None]
+        
+        if not max_temps:
+            return None
+        
+        max_temps = np.array(max_temps)
+        min_temps = np.array(min_temps)
+        
+        return {
+            "max": {
+                "mean": np.mean(max_temps),
+                "std": np.std(max_temps),
+                "percentiles": {
+                    10: np.percentile(max_temps, 10),
+                    25: np.percentile(max_temps, 25),
+                    50: np.percentile(max_temps, 50),
+                    75: np.percentile(max_temps, 75),
+                    90: np.percentile(max_temps, 90),
+                },
+                "members": max_temps.tolist(),
+            },
+            "min": {
+                "mean": np.mean(min_temps),
+                "std": np.std(min_temps),
+                "percentiles": {
+                    10: np.percentile(min_temps, 10),
+                    25: np.percentile(min_temps, 25),
+                    50: np.percentile(min_temps, 50),
+                    75: np.percentile(min_temps, 75),
+                    90: np.percentile(min_temps, 90),
+                },
+                "members": min_temps.tolist(),
+            }
+        }
+    except Exception as e:
+        logger.warning(f"Error fetching ensemble NWP: {e}")
+        return None
+
+
 # ── Message Formatting ───────────────────────────────────────────
 
 def format_message(target_date, predictions, market_prices, actual_temps):
@@ -408,10 +586,13 @@ def format_message(target_date, predictions, market_prices, actual_temps):
         lines.append("  🔴 *HIGH:*")
         if best_bets["high"]["main"]:
             b = best_bets["high"]["main"]
+            kelly = b.get("kelly_stake", 0)
             # Check if main bet is underpriced
             if b["edge"] > 0:
                 lines.append(f"     📌 Main: {b['bucket']} @ {b['market']:.0%} 💎")
                 lines.append(f"        Model: {b['model']:.0%} | Edge: {b['edge']:+.1%} | UNDERPRICED!")
+                if kelly > 0:
+                    lines.append(f"        💵 Kelly stake: ${kelly:.2f}")
             else:
                 lines.append(f"     📌 Main: {b['bucket']} @ {b['market']:.0%}")
                 lines.append(f"        Model: {b['model']:.0%} | Edge: {b['edge']:+.1%}")
@@ -420,8 +601,11 @@ def format_message(target_date, predictions, market_prices, actual_temps):
         
         if best_bets["high"]["lottery"]:
             b = best_bets["high"]["lottery"]
+            kelly = b.get("kelly_stake", 0)
             lines.append(f"     🎰 Lottery: {b['bucket']} @ {b['market']:.0%}")
             lines.append(f"        Model: {b['model']:.0%} | Edge: {b['edge']:+.1%} | {b['confidence']}")
+            if kelly > 0:
+                lines.append(f"        💵 Kelly stake: ${kelly:.2f}")
         else:
             lines.append("     🎰 Lottery: No value bet found")
         
@@ -431,10 +615,13 @@ def format_message(target_date, predictions, market_prices, actual_temps):
         lines.append("  🔵 *LOW:*")
         if best_bets["low"]["main"]:
             b = best_bets["low"]["main"]
+            kelly = b.get("kelly_stake", 0)
             # Check if main bet is underpriced
             if b["edge"] > 0:
                 lines.append(f"     📌 Main: {b['bucket']} @ {b['market']:.0%} 💎")
                 lines.append(f"        Model: {b['model']:.0%} | Edge: {b['edge']:+.1%} | UNDERPRICED!")
+                if kelly > 0:
+                    lines.append(f"        💵 Kelly stake: ${kelly:.2f}")
             else:
                 lines.append(f"     📌 Main: {b['bucket']} @ {b['market']:.0%}")
                 lines.append(f"        Model: {b['model']:.0%} | Edge: {b['edge']:+.1%}")
@@ -443,13 +630,17 @@ def format_message(target_date, predictions, market_prices, actual_temps):
         
         if best_bets["low"]["lottery"]:
             b = best_bets["low"]["lottery"]
+            kelly = b.get("kelly_stake", 0)
             lines.append(f"     🎰 Lottery: {b['bucket']} @ {b['market']:.0%}")
             lines.append(f"        Model: {b['model']:.0%} | Edge: {b['edge']:+.1%} | {b['confidence']}")
+            if kelly > 0:
+                lines.append(f"        💵 Kelly stake: ${kelly:.2f}")
         else:
             lines.append("     🎰 Lottery: No value bet found")
         
         lines.append("")
         lines.append("  _📌 Main = sesuai forecast | 🎰 Lottery = underpriced | 💎 = main also underpriced_")
+        lines.append("  _💵 Kelly stake = optimal bet size (quarter-Kelly, bankroll=${})_".format(int(BANKROLL)))
         lines.append("")
 
     # Other value bets
@@ -549,6 +740,12 @@ def find_recommended_bets(predictions, market_prices, date_str):
             main_candidates.sort(key=lambda x: x["score"], reverse=True)
             best_main = main_candidates[0]
             best_main["confidence"] = "MAIN"
+            # Improvement #3: Calculate Kelly stake
+            if best_main["market"] > 0:
+                odds = 1.0 / best_main["market"]
+                best_main["kelly_stake"] = calculate_kelly_stake(best_main["model"], odds)
+            else:
+                best_main["kelly_stake"] = 0.0
             results[result_key]["main"] = best_main
         
         # Find LOTTERY TICKET: underpriced value bet
@@ -583,6 +780,13 @@ def find_recommended_bets(predictions, market_prices, date_str):
                 best_lottery["confidence"] = "MEDIUM"
             else:
                 best_lottery["confidence"] = "LOW"
+            
+            # Improvement #3: Calculate Kelly stake
+            if best_lottery["market"] > 0:
+                odds = 1.0 / best_lottery["market"]
+                best_lottery["kelly_stake"] = calculate_kelly_stake(best_lottery["model"], odds)
+            else:
+                best_lottery["kelly_stake"] = 0.0
             
             results[result_key]["lottery"] = best_lottery
 
@@ -653,7 +857,7 @@ def send_telegram(message):
 def run():
     """Main execution: predict tomorrow + fetch prices + send Telegram."""
     print("=" * 60)
-    print("  HK Weather Prediction Alert")
+    print("  HK Weather Prediction Alert v2")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
 
@@ -665,54 +869,86 @@ def run():
     print(f"\n  Target date: {date_str}")
 
     # Get recent data (1 year for DOY matching)
-    print("\n[1/5] Fetching recent temperature data...")
+    print("\n[1/7] Fetching recent temperature data...")
     recent = get_recent_data(365)
     print(f"  {len(recent)} days of data loaded")
 
     # Get HKO forecast
-    print("\n[2/5] Fetching HKO 9-day forecast...")
+    print("\n[2/7] Fetching HKO 9-day forecast...")
     forecasts = get_hko_forecast()
     print(f"  {len(forecasts)} days of forecast loaded")
 
+    # Improvement #5: Get ensemble NWP forecast
+    print("\n[3/7] Fetching ensemble NWP forecast...")
+    ensemble_nwp = get_ensemble_nwp_forecast()
+    if ensemble_nwp:
+        print(f"  Ensemble NWP loaded: {len(ensemble_nwp['max']['members'])} members")
+        print(f"  Max temp: {ensemble_nwp['max']['mean']:.1f}°C ± {ensemble_nwp['max']['std']:.1f}°C")
+        print(f"  Min temp: {ensemble_nwp['min']['mean']:.1f}°C ± {ensemble_nwp['min']['std']:.1f}°C")
+    else:
+        print("  Ensemble NWP not available, using HKO only")
+
     # Check if already resolved (actual temperature available)
-    print("\n[3/5] Checking if event is resolved...")
+    print("\n[4/7] Checking if event is resolved...")
     actual_max, actual_min = get_actual_temperature(target_date)
     if actual_max is not None:
         print(f"  RESOLVED: High {actual_max}°C, Low {actual_min}°C")
+        # Update performance tracker
+        if actual_max is not None:
+            update_prediction(date_str, "high", actual_max)
+        if actual_min is not None:
+            update_prediction(date_str, "low", actual_min)
     else:
         print(f"  Event not yet resolved")
 
     # Get Polymarket prices
-    print("\n[4/5] Fetching Polymarket market prices...")
+    print("\n[5/7] Fetching Polymarket market prices...")
     market_prices = get_market_prices()
     print(f"  {len(market_prices)} events found")
 
+    # Improvement #1: Extract dynamic bucket ranges
+    print("\n[6/7] Extracting dynamic bucket ranges...")
+    high_bucket_defs = extract_dynamic_buckets(market_prices, date_str, "highest")
+    low_bucket_defs = extract_dynamic_buckets(market_prices, date_str, "lowest")
+    print(f"  HIGH buckets: {len(high_bucket_defs)} ({high_bucket_defs[0][0]} to {high_bucket_defs[-1][0]})")
+    print(f"  LOW buckets: {len(low_bucket_defs)} ({low_bucket_defs[0][0]} to {low_bucket_defs[-1][0]})")
+
     # Generate predictions for tomorrow
-    print("\n[5/5] Generating predictions...")
+    print("\n[7/7] Generating predictions...")
     
-    # Find forecast for target date
+    # Find HKO forecast for target date
     target_forecast = None
     for fc in forecasts:
         if fc["date"].date() == target_date:
             target_forecast = fc
             break
     
+    # Blend HKO forecast with ensemble NWP if available
     if target_forecast:
-        max_fc = target_forecast["max_temp"]
-        min_fc = target_forecast["min_temp"]
-        print(f"  HKO Forecast: High {max_fc}°C / Low {min_fc}°C")
+        hko_max = target_forecast["max_temp"]
+        hko_min = target_forecast["min_temp"]
+        
+        if ensemble_nwp:
+            # 60% HKO + 40% Ensemble NWP mean
+            max_fc = 0.6 * hko_max + 0.4 * ensemble_nwp["max"]["mean"]
+            min_fc = 0.6 * hko_min + 0.4 * ensemble_nwp["min"]["mean"]
+            print(f"  Blended Forecast: High {max_fc:.1f}°C / Low {min_fc:.1f}°C (HKO + NWP)")
+        else:
+            max_fc = hko_max
+            min_fc = hko_min
+            print(f"  HKO Forecast: High {max_fc}°C / Low {min_fc}°C")
     else:
         max_fc = None
         min_fc = None
-        print(f"  No HKO forecast available for {date_str}")
+        print(f"  No forecast available for {date_str}")
 
-    # Predict high temp buckets
+    # Predict high temp buckets using dynamic bucket definitions
     high_probs, high_mean, high_std = predict_buckets(
-        'max', recent, target_date, forecast_temp=max_fc
+        'max', recent, target_date, forecast_temp=max_fc, bucket_defs=high_bucket_defs
     )
-    # Predict low temp buckets
+    # Predict low temp buckets using dynamic bucket definitions
     low_probs, low_mean, low_std = predict_buckets(
-        'min', recent, target_date, forecast_temp=min_fc
+        'min', recent, target_date, forecast_temp=min_fc, bucket_defs=low_bucket_defs
     )
 
     predictions = {
@@ -721,6 +957,7 @@ def run():
         "low_probs": low_probs,
         "high_mean": high_mean,
         "low_mean": low_mean,
+        "ensemble_nwp": ensemble_nwp,
     }
 
     best_high = max(high_probs, key=high_probs.get)
@@ -733,6 +970,13 @@ def run():
     actual_temps = (actual_max, actual_min) if actual_max is not None else None
     message = format_message(target_date, predictions, market_prices, actual_temps)
     
+    # Improvement #4: Log predictions for performance tracking
+    if actual_max is None:  # Only log if not resolved yet
+        best_bets = find_recommended_bets(predictions, market_prices, date_str)
+        log_prediction(date_str, "high", high_probs, best_bets.get("high", {}))
+        log_prediction(date_str, "low", low_probs, best_bets.get("low", {}))
+        print("\n  [OK] Predictions logged for performance tracking")
+
     try:
         print(f"\n--- Message Preview ---")
         print(message.encode('utf-8', errors='replace').decode('utf-8'))

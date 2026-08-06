@@ -21,6 +21,13 @@ Resolution source: HKO "Absolute Daily Max/Min" dari [Daily Extract](https://www
 - **Telegram Alert**: Hourly prediction alerts with market price comparison
 - **Streamlit GUI**: Interactive dashboard untuk monitoring
 
+### v2 Improvements
+
+- **Dynamic Bucket Ranges**: Bucket ranges extracted live from Polymarket (shift daily)
+- **Kelly Criterion**: Optimal bet sizing with quarter-Kelly (0.25 fraction), capped at 10% bankroll
+- **Model Performance Tracking**: JSONL log of predictions vs outcomes, Brier score, win rate, ROI
+- **Ensemble NWP Integration**: 80 members (50 ECMWF + 30 GFS) blended 60% HKO + 40% NWP
+
 ## Project Structure
 
 ```
@@ -31,12 +38,13 @@ hk_weather_bet/
 ├── model.py               # Model training utilities
 ├── backtest_v5.py         # Backtest v5 (direct bucket classifier)
 ├── polymarket_scraper.py  # Polymarket price scraper
-├── telegram_alert.py      # Hourly Telegram prediction alerts
+├── telegram_alert.py      # Hourly Telegram prediction alerts (v2)
+├── model_tracker.py       # Model performance tracking
 ├── app.py                 # Streamlit GUI
 ├── nwp_collector.py       # Open-Meteo ensemble collector
 ├── data/
 │   ├── raw/               # Raw downloaded data
-│   └── processed/         # Processed data, backtest results
+│   └── processed/         # Processed data, backtest results, performance log
 └── models/                # Trained model files
 ```
 
@@ -79,11 +87,14 @@ python polymarket_scraper.py
 
 Hourly alerts sent to Telegram with:
 - Model predictions vs Polymarket prices
-- Value bets (edge >5%)
+- Value bets (edge >5%) with MAIN + LOTTERY recommendations
+- Kelly Criterion bet sizing suggestions
 - Resolution status
+- Ensemble NWP uncertainty quantification
 
 ## Notes
 
 - Markets aktif Mei–Oktober setiap tahun
 - HKO forecast sangat akurat untuk 1-3 hari ahead
-- Model menggunakan 50% HKO forecast + 30% historical + 20% recent trend
+- Model menggunakan 60% HKO forecast + 40% ensemble NWP (80 members)
+- Predictions logged for performance tracking (Brier score, win rate, ROI)
