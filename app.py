@@ -622,6 +622,62 @@ elif page == "Bankroll":
     else:
         st.info("No +EV scenarios at current bankroll level.")
 
+    st.divider()
+
+    # ── Market Efficiency Analysis ─────────────────────────────────
+    st.markdown("## Market Efficiency Analysis")
+    st.caption("Analyze how Polymarket prices compare to historical frequencies")
+
+    from market_analyzer import analyze_bucket_accuracy, fetch_hka_data, detect_market_patterns
+
+    if st.button("Run Market Analysis (fetches live data)", type="primary", key="btn_market_analysis"):
+        with st.spinner("Analyzing market efficiency..."):
+            try:
+                data = fetch_hka_data()
+                recent_cutoff = data.index.max() - pd.DateOffset(years=5)
+                recent = data[data.index >= recent_cutoff]
+
+                # Summer months (market season)
+                summer = data[data.index.month.isin([5, 6, 7, 8, 9, 10])]
+                summer_recent = summer[summer.index >= recent_cutoff]
+
+                me1, me2 = st.columns(2)
+
+                for col, bucket_defs, temp_col, label in [
+                    (me1, DEFAULT_HIGH_TEMP_BUCKETS, "max_temp", "HIGH"),
+                    (me2, DEFAULT_LOW_TEMP_BUCKETS, "min_temp", "LOW"),
+                ]:
+                    with col:
+                        st.markdown(f"### {label} Temperature")
+
+                        # Historical frequency (summer)
+                        summer_data = recent[recent.index.month.isin([5, 6, 7, 8, 9, 10])]
+                        freq = analyze_bucket_accuracy(bucket_defs, summer_data, temp_col)
+
+                        # Show bucket frequencies
+                        freq_rows = []
+                        for blabel, stats in sorted(freq.items(), key=lambda x: x[1]["frequency"], reverse=True):
+                            freq_rows.append({
+                                "Bucket": blabel,
+                                "Frequency": f"{stats['frequency']:.1%}",
+                                "Count": stats["count"],
+                            })
+                        st.dataframe(pd.DataFrame(freq_rows), use_container_width=True, hide_index=True)
+
+                        # Stats
+                        temps = summer_data[temp_col]
+                        st.caption(f"Summer mean: {temps.mean():.1f}\u00b0C \u00b1 {temps.std():.1f}\u00b0C (n={len(summer_data)})")
+
+                # Pattern detection
+                st.divider()
+                st.markdown("### Detected Patterns")
+                patterns = detect_market_patterns()
+                for s in patterns.get("summary", []):
+                    st.info(s)
+
+            except Exception as e:
+                st.error(f"Market analysis failed: {e}")
+
 
 # ====================================================================
 # PAGE: Historical Data
@@ -781,6 +837,62 @@ elif page == "Model Training":
             st.dataframe(pred_df, use_container_width=True, hide_index=True)
     else:
         st.info("Train models first to enable predictions.")
+
+    # ── Auto-Retrain Pipeline ─────────────────────────────────────
+    st.divider()
+    st.markdown("### Auto-Retrain Pipeline (v5 Bucket Classifier)")
+    st.caption("Retrain the direct bucket classifier with latest HKA data. Deploys only if improved.")
+
+    from auto_retrain import get_model_status, get_retrain_history, run_full_retrain
+
+    # Show current model status
+    model_status = get_model_status()
+    ms1, ms2 = st.columns(2)
+    for col, tt in [(ms1, "high"), (ms2, "low")]:
+        with col:
+            s = model_status[tt]
+            if s["exists"]:
+                st.success(f"**{tt.upper()}** model trained {s['trained_at'][:10]}")
+                st.metric("Validation Score", f"{s['val_score']:.1%}" if s['val_score'] else "N/A")
+                st.caption(f"Training data: {s['train_days']} days")
+            else:
+                st.warning(f"**{tt.upper()}** no retrained model yet")
+
+    retrain_years = st.slider("Training window (years)", 3, 10, 5, key="retrain_years")
+
+    if st.button("Run Retraining (fetches live data)", type="primary", key="btn_retrain"):
+        with st.spinner("Retraining models with latest data..."):
+            try:
+                results = run_full_retrain(train_years=retrain_years, deploy_if_better=True)
+                st.success("Retraining complete!")
+
+                rc1, rc2 = st.columns(2)
+                for col, tt in [(rc1, "high"), (rc2, "low")]:
+                    with col:
+                        r = results[tt]
+                        old = f"{r['old_val_score']:.1%}" if r['old_val_score'] else "N/A"
+                        delta = f"{r['val_score'] - (r['old_val_score'] or 0):+.1%}"
+                        status = "DEPLOYED" if r["deployed"] else "KEPT OLD"
+                        st.metric(f"{tt.upper()} Validation", f"{r['val_score']:.1%}", delta=delta)
+                        st.caption(f"Old: {old} | {status}")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Retrain failed: {e}")
+
+    # Show retrain history
+    history = get_retrain_history()
+    if history:
+        st.markdown("**Retrain History:**")
+        hist_rows = []
+        for h in history[-10:]:
+            hist_rows.append({
+                "Date": h["timestamp"][:10],
+                "Type": h["temp_type"].upper(),
+                "Val Score": f"{h['val_score']:.1%}",
+                "Old Score": f"{h['old_val_score']:.1%}" if h.get("old_val_score") else "N/A",
+                "Deployed": "Yes" if h["deployed"] else "No",
+            })
+        st.dataframe(pd.DataFrame(hist_rows), use_container_width=True, hide_index=True)
 
 
 # ====================================================================

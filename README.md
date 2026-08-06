@@ -29,6 +29,8 @@ Resolution source: HKO "Absolute Daily Max/Min" dari [Daily Extract](https://www
 - **Ensemble NWP Integration**: 80 members (50 ECMWF + 30 GFS) blended 60% HKO + 40% NWP
 - **Multi-Day Bias Correction**: EWMA-based learning from prediction errors, auto-corrects forecast drift
 - **Bankroll Dashboard**: P&L tracking, prediction history, bias visualization, Kelly reference table
+- **Auto-Retrain Pipeline**: Weekly GBM classifier retraining with validation comparison, auto-deploy if improved
+- **Market Efficiency Analysis**: Historical frequency analysis, pattern detection, mispricing identification
 
 ## Project Structure
 
@@ -43,6 +45,8 @@ hk_weather_bet/
 ├── telegram_alert.py      # Hourly Telegram prediction alerts (v2)
 ├── model_tracker.py       # Model performance tracking
 ├── bias_corrector.py      # Multi-day bias correction (EWMA)
+├── auto_retrain.py        # Auto-retrain pipeline (weekly retraining)
+├── market_analyzer.py     # Market efficiency analysis
 ├── app.py                 # Streamlit GUI
 ├── nwp_collector.py       # Open-Meteo ensemble collector
 ├── data/
