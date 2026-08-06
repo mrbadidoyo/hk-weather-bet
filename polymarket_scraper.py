@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 #
 # Deploy your own proxy: see cloudflare_worker/README.md
 # Example: PROXY_URL = "https://polymarket-proxy.your-subdomain.workers.dev"
-PROXY_URL = ""  # <-- Set your worker URL here
+PROXY_URL = "https://polymarket-proxy.thebadidoyo.workers.dev"  # <-- Set your worker URL here
 
 # API endpoints (routed through proxy if PROXY_URL is set)
 if PROXY_URL:
