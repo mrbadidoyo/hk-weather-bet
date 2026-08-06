@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+
+# Data files (too large for GitHub)
+data/raw/
+data/processed/*.csv
+data/processed/*.pkl
+data/processed/*.joblib
+!data/processed/.gitkeep
+
+# Models (too large)
+models/*.joblib
+models/*.pkl
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Debug files
+_debug_*.py
+_test_*.py
