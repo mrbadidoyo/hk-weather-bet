@@ -79,56 +79,75 @@ def fetch_hka_data():
 
 
 # ──────────────────────────────────────────────────────────────
-# Feature Engineering for Classifier
+# Feature Engineering for Classifier (leakage-fixed)
 # ──────────────────────────────────────────────────────────────
 
-def build_features(df, temp_col, window_doy=5):
+def build_features(df, temp_col, doy_stats=None):
     """
-    Build features for the bucket classifier.
-    Uses same-day historical stats + rolling + trend.
+    Build features for the bucket classifier — NO TARGET LEAKAGE.
+
+    Rules:
+    - Rolling / lag / vol / diff only use PAST days (shifted by 1).
+    - anomaly = lag1 - hist_mean  (never uses today's actual temperature).
+    - hist_* stats come from training-only DOY statistics (passed in or computed).
     """
     df = df.copy()
     df['doy'] = df.index.dayofyear
     df['month'] = df.index.month
     df['year'] = df.index.year
 
-    # Same-day historical stats (expanding window per DOY)
-    doy_stats = df.groupby('doy')[temp_col].agg(['mean', 'std', 'min', 'max', 'count'])
-    doy_stats['std'] = doy_stats['std'].clip(lower=0.5)
-    doy_stats.columns = [f'hist_{c}' for c in doy_stats.columns]
+    # --- Past-only rolling features (shift 1 so current day is excluded) ---
+    past = df[temp_col].shift(1)
 
-    # Rolling features
-    df[f'{temp_col}_roll3'] = df[temp_col].rolling(3, min_periods=1).mean()
-    df[f'{temp_col}_roll7'] = df[temp_col].rolling(7, min_periods=1).mean()
-    df[f'{temp_col}_roll14'] = df[temp_col].rolling(14, min_periods=1).mean()
-    df[f'{temp_col}_roll30'] = df[temp_col].rolling(30, min_periods=1).mean()
+    df[f'{temp_col}_roll3'] = past.rolling(3, min_periods=1).mean()
+    df[f'{temp_col}_roll7'] = past.rolling(7, min_periods=1).mean()
+    df[f'{temp_col}_roll14'] = past.rolling(14, min_periods=1).mean()
+    df[f'{temp_col}_roll30'] = past.rolling(30, min_periods=1).mean()
 
-    # Trend features
-    df[f'{temp_col}_diff3'] = df[temp_col].diff(3)
-    df[f'{temp_col}_diff7'] = df[temp_col].diff(7)
+    # Trend (also past-only)
+    df[f'{temp_col}_diff3'] = past.diff(3)
+    df[f'{temp_col}_diff7'] = past.diff(7)
 
-    # Lag features
+    # Explicit lags
     df[f'{temp_col}_lag1'] = df[temp_col].shift(1)
     df[f'{temp_col}_lag2'] = df[temp_col].shift(2)
     df[f'{temp_col}_lag7'] = df[temp_col].shift(7)
 
-    # Volatility
-    df[f'{temp_col}_vol7'] = df[temp_col].rolling(7, min_periods=1).std()
-    df[f'{temp_col}_vol14'] = df[temp_col].rolling(14, min_periods=1).std()
+    # Volatility of past window
+    df[f'{temp_col}_vol7'] = past.rolling(7, min_periods=1).std()
+    df[f'{temp_col}_vol14'] = past.rolling(14, min_periods=1).std()
 
-    # Cyclical features
+    # Cyclical calendar features (safe)
     df['doy_sin'] = np.sin(2 * np.pi * df['doy'] / 365.25)
     df['doy_cos'] = np.cos(2 * np.pi * df['doy'] / 365.25)
     df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
     df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
 
-    # Merge DOY stats
+    # Historical DOY stats
+    if doy_stats is None:
+        # Compute from the provided df (caller should pass training-only stats
+        # when building features for the test set)
+        doy_stats = df.groupby('doy')[temp_col].agg(['mean', 'std', 'min', 'max', 'count'])
+        doy_stats['std'] = doy_stats['std'].clip(lower=0.5)
+        doy_stats.columns = [f'hist_{c}' for c in doy_stats.columns]
+
     df = df.join(doy_stats, on='doy')
 
-    # Anomaly from historical mean
-    df['anomaly'] = df[temp_col] - df['hist_mean']
+    # Anomaly must NOT use today's temperature (that is the target)
+    # Use lag1 vs climatological mean instead
+    df['anomaly'] = df[f'{temp_col}_lag1'] - df['hist_mean']
 
     return df
+
+
+def compute_doy_stats(train_df, temp_col):
+    """Compute DOY climatology from training data only (no leakage)."""
+    tmp = train_df.copy()
+    tmp['doy'] = tmp.index.dayofyear
+    stats = tmp.groupby('doy')[temp_col].agg(['mean', 'std', 'min', 'max', 'count'])
+    stats['std'] = stats['std'].clip(lower=0.5)
+    stats.columns = [f'hist_{c}' for c in stats.columns]
+    return stats
 
 
 def temp_to_bucket(temp, bucket_defs):
@@ -147,13 +166,14 @@ def temp_to_bucket(temp, bucket_defs):
 
 
 # ──────────────────────────────────────────────────────────────
-# Direct Bucket Classifier
+# Direct Bucket Classifier (leakage-fixed)
 # ──────────────────────────────────────────────────────────────
 
 class BucketClassifier:
     """
     GBM classifier that directly predicts bucket label.
-    Uses class_weight balancing to handle underrepresented buckets.
+    Uses class-balanced sample weights.
+    Stores training DOY stats so inference can use real climatology.
     """
 
     def __init__(self, bucket_defs, temp_col):
@@ -171,62 +191,72 @@ class BucketClassifier:
         )
         self.label_encoder = LabelEncoder()
         self.feature_cols = None
+        self.doy_stats = None          # stored after fit
         self.is_fitted = False
 
     def fit(self, train_df):
-        """Train classifier on historical data."""
-        df = build_features(train_df, self.temp_col)
+        """Train classifier on historical data (no target leakage)."""
+        # Climatology from training set only
+        self.doy_stats = compute_doy_stats(train_df, self.temp_col)
+
+        df = build_features(train_df, self.temp_col, doy_stats=self.doy_stats)
         df = df.dropna(subset=[self.temp_col])
 
-        # Assign bucket labels
+        # Target bucket (uses actual temperature — this is the label, not a feature)
         df['bucket'] = df[self.temp_col].apply(lambda t: temp_to_bucket(t, self.bucket_defs))
 
-        # Feature columns
-        feature_cols = ['doy', 'month', 'doy_sin', 'doy_cos', 'month_sin', 'month_cos',
-                        f'{self.temp_col}_roll3', f'{self.temp_col}_roll7',
-                        f'{self.temp_col}_roll14', f'{self.temp_col}_roll30',
-                        f'{self.temp_col}_diff3', f'{self.temp_col}_diff7',
-                        f'{self.temp_col}_lag1', f'{self.temp_col}_lag2', f'{self.temp_col}_lag7',
-                        f'{self.temp_col}_vol7', f'{self.temp_col}_vol14',
-                        'hist_mean', 'hist_std', 'hist_min', 'hist_max', 'hist_count',
-                        'anomaly']
+        feature_cols = [
+            'doy', 'month', 'doy_sin', 'doy_cos', 'month_sin', 'month_cos',
+            f'{self.temp_col}_roll3', f'{self.temp_col}_roll7',
+            f'{self.temp_col}_roll14', f'{self.temp_col}_roll30',
+            f'{self.temp_col}_diff3', f'{self.temp_col}_diff7',
+            f'{self.temp_col}_lag1', f'{self.temp_col}_lag2', f'{self.temp_col}_lag7',
+            f'{self.temp_col}_vol7', f'{self.temp_col}_vol14',
+            'hist_mean', 'hist_std', 'hist_min', 'hist_max', 'hist_count',
+            'anomaly',
+        ]
         self.feature_cols = [c for c in feature_cols if c in df.columns]
 
-        # Drop rows with NaN in features
-        X_df = df[self.feature_cols].fillna(0)
-        y = df['bucket'].values
+        # Drop rows that still have NaN in critical lag features
+        X_df = df[self.feature_cols].copy()
+        # After shift(1) the first few rows are NaN — drop them
+        valid = X_df.notna().all(axis=1)
+        X_df = X_df.loc[valid].fillna(0)
+        y = df.loc[valid, 'bucket'].values
 
-        # Encode labels
         self.label_encoder.fit(self.labels)
+        # Guard: only keep labels that exist in training
+        known = set(self.label_encoder.classes_)
+        mask = np.array([lab in known for lab in y])
+        X_df = X_df.iloc[mask]
+        y = y[mask]
+
         y_encoded = self.label_encoder.transform(y)
 
-        # Compute class weights for balanced training
+        # Class-balanced sample weights
         class_counts = pd.Series(y_encoded).value_counts()
         n_samples = len(y_encoded)
-        n_classes = len(self.labels)
+        n_classes = len(self.label_encoder.classes_)
         sample_weights = np.zeros(len(y_encoded))
-        for i, (cls, count) in enumerate(class_counts.items()):
+        for cls, count in class_counts.items():
             weight = n_samples / (n_classes * count)
             sample_weights[y_encoded == cls] = weight
 
-        # Train with sample weights
-        X = X_df.values
-        self.clf.fit(X, y_encoded, sample_weight=sample_weights)
+        self.clf.fit(X_df.values, y_encoded, sample_weight=sample_weights)
         self.is_fitted = True
 
-        # Feature importance
         importances = dict(zip(self.feature_cols, self.clf.feature_importances_))
         return importances
 
     def predict_proba(self, date, recent_data):
         """
         Predict bucket probabilities for a given date.
-        Returns dict: {bucket_label: probability}
+        recent_data: dict with key = temp_col and value = list of past temperatures
+                     (most recent last). Must NOT contain today's actual value.
         """
         if not self.is_fitted:
             return None
 
-        # Build a single-row feature set
         doy = date.timetuple().tm_yday
         month = date.month
 
@@ -239,48 +269,59 @@ class BucketClassifier:
             'month_cos': np.cos(2 * np.pi * month / 12),
         }
 
-        # Recent data features
-        recent_vals = recent_data.get(self.temp_col, [])
-        if len(recent_vals) >= 7:
-            features[f'{self.temp_col}_roll3'] = np.mean(recent_vals[-3:])
-            features[f'{self.temp_col}_roll7'] = np.mean(recent_vals[-7:])
-            features[f'{self.temp_col}_roll14'] = np.mean(recent_vals[-14:]) if len(recent_vals) >= 14 else features[f'{self.temp_col}_roll7']
-            features[f'{self.temp_col}_roll30'] = features[f'{self.temp_col}_roll14']
-            features[f'{self.temp_col}_diff3'] = recent_vals[-1] - recent_vals[-4] if len(recent_vals) >= 4 else 0
-            features[f'{self.temp_col}_diff7'] = recent_vals[-1] - recent_vals[-8] if len(recent_vals) >= 8 else 0
+        recent_vals = list(recent_data.get(self.temp_col, []))
+
+        if len(recent_vals) >= 1:
+            # All of these are past values only
             features[f'{self.temp_col}_lag1'] = recent_vals[-1]
             features[f'{self.temp_col}_lag2'] = recent_vals[-2] if len(recent_vals) >= 2 else recent_vals[-1]
             features[f'{self.temp_col}_lag7'] = recent_vals[-7] if len(recent_vals) >= 7 else recent_vals[-1]
-            features[f'{self.temp_col}_vol7'] = np.std(recent_vals[-7:])
-            features[f'{self.temp_col}_vol14'] = np.std(recent_vals[-14:]) if len(recent_vals) >= 14 else features[f'{self.temp_col}_vol7']
+
+            features[f'{self.temp_col}_roll3'] = float(np.mean(recent_vals[-3:]))
+            features[f'{self.temp_col}_roll7'] = float(np.mean(recent_vals[-7:])) if len(recent_vals) >= 7 else features[f'{self.temp_col}_roll3']
+            features[f'{self.temp_col}_roll14'] = float(np.mean(recent_vals[-14:])) if len(recent_vals) >= 14 else features[f'{self.temp_col}_roll7']
+            features[f'{self.temp_col}_roll30'] = float(np.mean(recent_vals[-30:])) if len(recent_vals) >= 30 else features[f'{self.temp_col}_roll14']
+
+            features[f'{self.temp_col}_diff3'] = (recent_vals[-1] - recent_vals[-4]) if len(recent_vals) >= 4 else 0.0
+            features[f'{self.temp_col}_diff7'] = (recent_vals[-1] - recent_vals[-8]) if len(recent_vals) >= 8 else 0.0
+
+            features[f'{self.temp_col}_vol7'] = float(np.std(recent_vals[-7:])) if len(recent_vals) >= 7 else 0.0
+            features[f'{self.temp_col}_vol14'] = float(np.std(recent_vals[-14:])) if len(recent_vals) >= 14 else features[f'{self.temp_col}_vol7']
         else:
-            for col in [f'{self.temp_col}_roll3', f'{self.temp_col}_roll7',
-                        f'{self.temp_col}_roll14', f'{self.temp_col}_roll30',
-                        f'{self.temp_col}_diff3', f'{self.temp_col}_diff7',
-                        f'{self.temp_col}_lag1', f'{self.temp_col}_lag2', f'{self.temp_col}_lag7',
-                        f'{self.temp_col}_vol7', f'{self.temp_col}_vol14']:
-                features[col] = 0
+            for col in [
+                f'{self.temp_col}_roll3', f'{self.temp_col}_roll7',
+                f'{self.temp_col}_roll14', f'{self.temp_col}_roll30',
+                f'{self.temp_col}_diff3', f'{self.temp_col}_diff7',
+                f'{self.temp_col}_lag1', f'{self.temp_col}_lag2', f'{self.temp_col}_lag7',
+                f'{self.temp_col}_vol7', f'{self.temp_col}_vol14',
+            ]:
+                features[col] = 0.0
 
-        # Historical DOY stats (would need to be pre-computed)
-        features['hist_mean'] = features.get('hist_mean', 0)
-        features['hist_std'] = features.get('hist_std', 1)
-        features['hist_min'] = features.get('hist_min', 0)
-        features['hist_max'] = features.get('hist_max', 0)
-        features['hist_count'] = features.get('hist_count', 100)
-        features['anomaly'] = 0
+        # Real climatology from training DOY stats
+        if self.doy_stats is not None and doy in self.doy_stats.index:
+            row = self.doy_stats.loc[doy]
+            features['hist_mean'] = float(row['hist_mean'])
+            features['hist_std'] = float(row['hist_std'])
+            features['hist_min'] = float(row['hist_min'])
+            features['hist_max'] = float(row['hist_max'])
+            features['hist_count'] = float(row['hist_count'])
+        else:
+            features['hist_mean'] = 0.0
+            features['hist_std'] = 1.0
+            features['hist_min'] = 0.0
+            features['hist_max'] = 0.0
+            features['hist_count'] = 0.0
 
-        # Build feature vector
-        X = np.array([[features.get(c, 0) for c in self.feature_cols]])
+        # Anomaly = most recent past temp vs climatology (never uses today)
+        features['anomaly'] = features.get(f'{self.temp_col}_lag1', 0.0) - features['hist_mean']
 
-        # Predict
+        # Build feature vector in the exact order used at training
+        X = np.array([[features.get(c, 0.0) for c in self.feature_cols]])
+
         proba = self.clf.predict_proba(X)[0]
         classes = self.label_encoder.classes_
 
-        probs = {}
-        for i, cls in enumerate(classes):
-            probs[cls] = float(proba[i])
-
-        return probs
+        return {cls: float(proba[i]) for i, cls in enumerate(classes)}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -326,31 +367,29 @@ def run_backtest_v5(years_back=5):
     max_emp = ImprovedPredictor(train, 'max_temp', window_doy=5)
     min_emp = ImprovedPredictor(train, 'min_temp', window_doy=5)
 
-    # ── Vectorized predictions ──
+    # ── Vectorized predictions (leakage-free) ──
     print(f"\n[4/6] Building features for {len(test)} test days...")
 
-    # Build features for the full dataset (train + test) for rolling/lag computation
+    # Use FULL series only for computing past rolling/lag values,
+    # but hist_* stats come exclusively from the training set.
     full_data = pd.concat([train, test])
-    full_max = build_features(full_data, 'max_temp')
-    full_min = build_features(full_data, 'min_temp')
 
-    # Split back
+    full_max = build_features(full_data, 'max_temp', doy_stats=max_clf.doy_stats)
+    full_min = build_features(full_data, 'min_temp', doy_stats=min_clf.doy_stats)
+
     test_max = full_max.loc[test.index]
     test_min = full_min.loc[test.index]
 
-    # Prepare classifier feature matrices
-    def get_clf_features(test_feat_df, temp_col, feature_cols):
-        X = test_feat_df[feature_cols].fillna(0).values
-        return X
+    def get_clf_features(test_feat_df, feature_cols):
+        return test_feat_df[feature_cols].fillna(0).values
 
     print("  Running classifier predictions...")
-    X_max = get_clf_features(test_max, 'max_temp', max_clf.feature_cols)
-    X_min = get_clf_features(test_min, 'min_temp', min_clf.feature_cols)
+    X_max = get_clf_features(test_max, max_clf.feature_cols)
+    X_min = get_clf_features(test_min, min_clf.feature_cols)
 
     clf_max_proba = max_clf.clf.predict_proba(X_max)
     clf_min_proba = min_clf.clf.predict_proba(X_min)
 
-    # Convert to dict format
     clf_max_labels = max_clf.label_encoder.classes_
     clf_min_labels = min_clf.label_encoder.classes_
 
