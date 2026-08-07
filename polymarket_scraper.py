@@ -125,33 +125,78 @@ class PolymarketScraper:
         """
         Extract current prices from event data.
         The Gamma API event response includes markets with outcomePrices.
+
+        Returns:
+            dict {bucket_label: yes_price}
         """
         prices = {}
         for market in event.get("markets", []):
             question = market.get("question", "")
-            outcome = market.get("outcome", "")
+            # Prefer groupItemTitle / outcome / short title for bucket label
+            outcome = (
+                market.get("groupItemTitle")
+                or market.get("outcome")
+                or market.get("groupItemThreshold")
+                or ""
+            )
             outcome_prices = market.get("outcomePrices", "")
 
-            # Parse outcomePrices — it's a JSON string like '["0.25", "0.75"]'
+            # Parse outcomePrices — JSON string like '["0.25", "0.75"]' or list
+            yes_price = None
             if isinstance(outcome_prices, str):
                 try:
                     price_list = json.loads(outcome_prices)
-                    yes_price = float(price_list[0]) if len(price_list) > 0 else None
+                    yes_price = float(price_list[0]) if price_list else None
                 except (json.JSONDecodeError, ValueError, IndexError):
                     yes_price = None
             elif isinstance(outcome_prices, list):
-                yes_price = float(outcome_prices[0]) if len(outcome_prices) > 0 else None
-            else:
-                yes_price = None
+                yes_price = float(outcome_prices[0]) if outcome_prices else None
 
-            # Extract bucket label from question
-            # Pattern: "Highest temperature in Hong Kong on August 7?" with outcome "27°C or below"
-            bucket = outcome if outcome else question
+            # Fallback: try outcomes array
+            if not outcome:
+                outcomes = market.get("outcomes", [])
+                if isinstance(outcomes, str):
+                    try:
+                        outcomes = json.loads(outcomes)
+                    except Exception:
+                        outcomes = []
+                if outcomes and isinstance(outcomes, list):
+                    outcome = outcomes[0]
 
-            if yes_price is not None:
+            bucket = (outcome or question or "").strip()
+            if yes_price is not None and bucket:
                 prices[bucket] = yes_price
 
         return prices
+
+    def get_market_snapshot(self, event):
+        """
+        Richer snapshot: prices + dynamic bucket definitions + metadata.
+
+        Returns:
+            {
+              "date": "2026-08-08",
+              "type": "highest" | "lowest",
+              "title": "...",
+              "prices": {label: price},
+              "bucket_defs": [(label, lo, hi), ...],  # ready for strategy/NWP
+              "n_buckets": int,
+            }
+        """
+        from polymarket_strategy import buckets_from_labels
+
+        prices = self.get_current_prices(event)
+        bucket_defs = buckets_from_labels(list(prices.keys())) if prices else []
+
+        return {
+            "date": event.get("_date", ""),
+            "type": event.get("_type", ""),
+            "title": event.get("title", event.get("_slug", "")),
+            "slug": event.get("_slug", ""),
+            "prices": prices,
+            "bucket_defs": bucket_defs,
+            "n_buckets": len(bucket_defs),
+        }
 
     # ── Full Scrape Pipeline ──────────────────────────────────────
 

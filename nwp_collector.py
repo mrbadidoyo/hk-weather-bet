@@ -206,35 +206,67 @@ class NWPCollector:
         }
 
 
-def blend_probs(empirical_probs, nwp_probs, nwp_weight=0.5):
+def blend_probs(model_probs, nwp_probs, nwp_weight=0.4, labels=None):
     """
-    Blend empirical distribution probabilities with NWP ensemble probabilities.
+    Blend model (classifier/empirical) probabilities with NWP ensemble probabilities.
+
+    Uses the union of labels so dynamic buckets from the market are respected.
+    Missing keys are treated as 0 before normalization.
 
     Args:
-        empirical_probs: dict {bucket_label: probability} from empirical model
-        nwp_probs: dict {bucket_label: probability} from NWP ensemble
-        nwp_weight: weight for NWP (0-1). Higher = more trust in NWP.
+        model_probs: dict {bucket_label: probability}
+        nwp_probs: dict {bucket_label: probability} from ensemble member counts
+        nwp_weight: weight for NWP (0-1). 0.4 = 60% model + 40% NWP (default)
+        labels: optional explicit list of labels to use (e.g. live market buckets)
 
     Returns:
-        dict: {bucket_label: blended_probability}
+        dict: {bucket_label: blended_probability} summing to 1.0
     """
+    if nwp_probs is None and model_probs is None:
+        return {}
     if nwp_probs is None:
-        return empirical_probs
-    if empirical_probs is None:
-        return nwp_probs
+        return dict(model_probs)
+    if model_probs is None:
+        return dict(nwp_probs)
+
+    if labels is None:
+        labels = sorted(set(model_probs.keys()) | set(nwp_probs.keys()))
 
     blended = {}
-    for label in empirical_probs:
-        e = empirical_probs.get(label, 0)
-        n = nwp_probs.get(label, 0)
-        blended[label] = (1 - nwp_weight) * e + nwp_weight * n
+    for label in labels:
+        e = model_probs.get(label, 0.0)
+        n = nwp_probs.get(label, 0.0)
+        blended[label] = (1.0 - nwp_weight) * e + nwp_weight * n
 
-    # Normalize
     total = sum(blended.values())
     if total > 0:
         blended = {k: v / total for k, v in blended.items()}
-
     return blended
+
+
+def live_nwp_bucket_probs(bucket_defs, temp_type="max", date_idx=0, forecast_days=7):
+    """
+    One-shot helper: fetch live NWP ensemble and return bucket probabilities
+    for the requested day index using the given (dynamic) bucket definitions.
+
+    Args:
+        bucket_defs: list of (label, lower, upper) — preferably from live market
+        temp_type: "max" or "min"
+        date_idx: 0 = today, 1 = tomorrow, ...
+        forecast_days: how many days to request from Open-Meteo
+
+    Returns:
+        (probs_dict, stats_dict) or (None, None) on failure
+    """
+    try:
+        nwp = NWPCollector()
+        ens = nwp.fetch_ensemble_forecast(forecast_days=forecast_days)
+        probs = nwp.ensemble_to_bucket_probs(ens, date_idx, bucket_defs, temp_type)
+        stats = nwp.ensemble_stats(ens, date_idx, temp_type)
+        return probs, stats
+    except Exception as e:
+        logger.warning(f"live_nwp_bucket_probs failed: {e}")
+        return None, None
 
 
 if __name__ == "__main__":

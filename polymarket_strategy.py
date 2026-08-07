@@ -1,8 +1,14 @@
 """
 Polymarket Strategy Module
-Converts temperature predictions into bucket probabilities and identifies +EV bets
+Converts temperature predictions into bucket probabilities and identifies +EV bets.
+
+Supports:
+- Fixed default buckets (config)
+- Dynamic buckets scraped live from Polymarket market outcomes
+- NWP ensemble probability blending
 """
 import logging
+import re
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -21,8 +27,8 @@ class Bucket:
     label: str
     lower: float  # inclusive
     upper: float  # exclusive (except for open-ended)
-    is_open_lower: bool = False  # True for "<X" buckets
-    is_open_upper: bool = False  # True for "X+" buckets
+    is_open_lower: bool = False  # True for "X or below"
+    is_open_upper: bool = False  # True for "X or higher"
 
     def contains(self, value: float) -> bool:
         if self.is_open_lower:
@@ -61,12 +67,96 @@ class MarketAnalysis:
     total_edge: float = 0.0
 
 
+# ──────────────────────────────────────────────────────────────
+# Dynamic bucket parsing from Polymarket labels
+# ──────────────────────────────────────────────────────────────
+
+# Patterns seen on Polymarket HK weather markets
+_RE_OR_BELOW = re.compile(r'^(\d+)\s*°?\s*C?\s*or\s*below$', re.I)
+_RE_OR_HIGHER = re.compile(r'^(\d+)\s*°?\s*C?\s*or\s*higher$', re.I)
+_RE_SINGLE = re.compile(r'^(\d+)\s*°?\s*C?$', re.I)
+_RE_RANGE = re.compile(r'^(\d+)\s*[-–]\s*(\d+)\s*°?\s*C?$', re.I)
+
+
+def parse_bucket_label(label: str) -> tuple[str, float, float, bool, bool] | None:
+    """
+    Parse a Polymarket outcome label into (label, lower, upper, is_open_lower, is_open_upper).
+
+    Examples:
+        "27°C or below"  → ("27°C or below", -999, 28, True, False)
+        "32°C"           → ("32°C", 32, 33, False, False)
+        "37°C or higher" → ("37°C or higher", 37, 999, False, True)
+        "30-31°C"        → ("30-31°C", 30, 32, False, False)
+    """
+    if not label or not isinstance(label, str):
+        return None
+
+    s = label.strip()
+
+    m = _RE_OR_BELOW.match(s)
+    if m:
+        t = int(m.group(1))
+        return (s, -999.0, float(t + 1), True, False)
+
+    m = _RE_OR_HIGHER.match(s)
+    if m:
+        t = int(m.group(1))
+        return (s, float(t), 999.0, False, True)
+
+    m = _RE_RANGE.match(s)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        return (s, float(lo), float(hi + 1), False, False)
+
+    m = _RE_SINGLE.match(s)
+    if m:
+        t = int(m.group(1))
+        return (s, float(t), float(t + 1), False, False)
+
+    return None
+
+
+def buckets_from_labels(labels: list[str]) -> list[tuple]:
+    """
+    Convert a list of Polymarket outcome labels into bucket_defs
+    suitable for parse_buckets / ensemble_to_bucket_probs.
+
+    Returns list of (label, lower, upper).
+    Falls back to empty list if nothing can be parsed.
+    """
+    defs = []
+    for lab in labels:
+        parsed = parse_bucket_label(lab)
+        if parsed is None:
+            logger.warning(f"Could not parse bucket label: {lab!r}")
+            continue
+        label, lo, hi, _, _ = parsed
+        defs.append((label, lo, hi))
+
+    # Sort by lower bound so open-ended buckets sit at the ends
+    defs.sort(key=lambda x: x[1])
+    return defs
+
+
 def parse_buckets(bucket_defs: list[tuple]) -> list[Bucket]:
-    """Parse bucket definitions into Bucket objects"""
+    """Parse bucket definitions into Bucket objects."""
     buckets = []
-    for label, lower, upper in bucket_defs:
-        is_open_lower = label.startswith("<")
-        is_open_upper = label.endswith("+")
+    for item in bucket_defs:
+        if len(item) == 3:
+            label, lower, upper = item
+            is_open_lower = lower <= -900
+            is_open_upper = upper >= 900
+        elif len(item) == 5:
+            label, lower, upper, is_open_lower, is_open_upper = item
+        else:
+            continue
+
+        # Also detect from label text
+        if "or below" in label.lower():
+            is_open_lower = True
+        if "or higher" in label.lower():
+            is_open_upper = True
+
         buckets.append(Bucket(
             label=label,
             lower=lower,
@@ -75,6 +165,19 @@ def parse_buckets(bucket_defs: list[tuple]) -> list[Bucket]:
             is_open_upper=is_open_upper,
         ))
     return buckets
+
+
+def get_buckets_for_market(market_prices: dict[str, float], temp_type: str = "high") -> list[tuple]:
+    """
+    Prefer dynamic buckets from live market prices.
+    Fall back to DEFAULT_* if market_prices is empty or unparseable.
+    """
+    if market_prices:
+        defs = buckets_from_labels(list(market_prices.keys()))
+        if defs:
+            return defs
+
+    return DEFAULT_HIGH_TEMP_BUCKETS if temp_type == "high" else DEFAULT_LOW_TEMP_BUCKETS
 
 
 def compute_bucket_probabilities(
