@@ -1,7 +1,14 @@
 """
-Multi-Day Bias Corrector — Learns from prediction errors over time.
-Tracks rolling forecast errors and applies corrections to future predictions.
+Multi-Day Bias Corrector (v2) — Range-aware / Conditional
+=========================================================
+Learns from prediction errors and applies corrections that depend on
+the predicted temperature range (instead of a single global shift).
+
+This specifically targets the cold bias problem:
+- High temp: systematic underprediction in 30-32°C and 34-36°C ranges
+- Low temp: systematic underprediction in 28-29°C range
 """
+
 import json
 import numpy as np
 from pathlib import Path
@@ -12,170 +19,344 @@ from config import PROCESSED_DATA_DIR
 
 BIAS_LOG = PROCESSED_DATA_DIR / "bias_corrections.jsonl"
 
+# Temperature ranges used for conditional bias (aligned with common Polymarket buckets)
+HIGH_RANGES = [
+    ("<=29", -999, 30),
+    ("30-32", 30, 33),
+    ("33-35", 33, 36),
+    ("36+", 36, 999),
+]
+
+LOW_RANGES = [
+    ("<=25", -999, 26),
+    ("26-27", 26, 28),
+    ("28-29", 28, 30),
+    ("30+", 30, 999),
+]
+
+
+def _get_range_label(temp: float, ranges: list) -> str:
+    """Return the range label that contains the given temperature."""
+    for label, lo, hi in ranges:
+        if lo <= temp < hi:
+            return label
+    return ranges[-1][0]
+
 
 def log_forecast_error(target_date, temp_type, predicted_mean, actual_temp):
     """
     Log a forecast error for bias tracking.
-    
+
     Args:
         target_date: Date string (YYYY-MM-DD)
         temp_type: 'high' or 'low'
         predicted_mean: Model's predicted mean temperature
         actual_temp: Actual observed temperature
     """
-    error = actual_temp - predicted_mean
-    
+    error = actual_temp - predicted_mean  # positive = model underpredicted
+
+    ranges = HIGH_RANGES if temp_type == "high" else LOW_RANGES
+    pred_range = _get_range_label(predicted_mean, ranges)
+    actual_range = _get_range_label(actual_temp, ranges)
+
     entry = {
         "timestamp": datetime.now().isoformat(),
-        "target_date": target_date,
+        "target_date": str(target_date),
         "temp_type": temp_type,
-        "predicted_mean": predicted_mean,
-        "actual_temp": actual_temp,
-        "error": error,
+        "predicted_mean": float(predicted_mean),
+        "actual_temp": float(actual_temp),
+        "error": float(error),
+        "pred_range": pred_range,
+        "actual_range": actual_range,
     }
-    
+
+    BIAS_LOG.parent.mkdir(parents=True, exist_ok=True)
     with open(BIAS_LOG, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
 
 
-def get_bias_correction(temp_type, lookback_days=14):
-    """
-    Calculate bias correction from recent forecast errors.
-    
-    Uses exponential weighted moving average (EWMA) to give more
-    weight to recent errors. If model consistently overpredicts
-    by 0.5°C, correction will shift predictions down.
-    
-    Args:
-        temp_type: 'high' or 'low'
-        lookback_days: How many days of errors to consider
-    
-    Returns:
-        dict with:
-        - correction: Temperature adjustment to add to predictions (°C)
-        - n_samples: Number of recent errors used
-        - mean_error: Raw mean error (positive = model underpredicts)
-        - ewma_error: EWMA of errors
-        - confidence: 'HIGH' if >7 samples, 'MEDIUM' if >3, 'LOW' otherwise
-    """
+def _load_recent_errors(temp_type: str, lookback_days: int = 30) -> list:
+    """Load recent error entries for a given temp_type."""
     if not BIAS_LOG.exists():
-        return {"correction": 0.0, "n_samples": 0, "mean_error": 0.0, 
-                "ewma_error": 0.0, "confidence": "LOW"}
-    
+        return []
+
     cutoff = (datetime.now() - timedelta(days=lookback_days)).isoformat()
-    
     errors = []
-    for line in BIAS_LOG.read_text(encoding="utf-8").strip().split("\n"):
+
+    try:
+        lines = BIAS_LOG.read_text(encoding="utf-8").strip().split("\n")
+    except Exception:
+        return []
+
+    for line in lines:
         if not line.strip():
             continue
-        entry = json.loads(line)
-        if (entry["temp_type"] == temp_type and 
-            entry["timestamp"] >= cutoff):
-            errors.append(entry)
-    
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        if entry.get("temp_type") != temp_type:
+            continue
+        if entry.get("timestamp", "") < cutoff:
+            continue
+        errors.append(entry)
+
+    errors.sort(key=lambda e: e.get("target_date", ""))
+    return errors
+
+
+def _ewma(values: list, alpha: float = 0.35) -> float:
+    """Exponential weighted moving average (more weight to recent)."""
+    if not values:
+        return 0.0
+    ewma = values[0]
+    for v in values[1:]:
+        ewma = alpha * v + (1 - alpha) * ewma
+    return float(ewma)
+
+
+def get_bias_correction(
+    temp_type: str,
+    predicted_mean: float = None,
+    lookback_days: int = 30,
+    min_samples_global: int = 5,
+    min_samples_range: int = 3,
+):
+    """
+    Calculate range-aware bias correction.
+
+    Priority:
+    1. If enough samples in the same predicted temperature range → use range-specific EWMA
+    2. Else fall back to global EWMA
+    3. Cap correction to avoid over-correction
+
+    Args:
+        temp_type: 'high' or 'low'
+        predicted_mean: Current model prediction (used to select the range). 
+                        If None, only global bias is returned.
+        lookback_days: How many days of history to consider
+        min_samples_global / min_samples_range: Minimum samples required
+
+    Returns:
+        dict with:
+        - correction: °C to ADD to the prediction
+        - source: 'range' | 'global' | 'none'
+        - range_label: which temperature band was used (if any)
+        - n_samples: samples used for the chosen correction
+        - n_global: total recent samples
+        - mean_error / ewma_error
+        - confidence: HIGH / MEDIUM / LOW
+    """
+    errors = _load_recent_errors(temp_type, lookback_days)
+
+    empty = {
+        "correction": 0.0,
+        "source": "none",
+        "range_label": None,
+        "n_samples": 0,
+        "n_global": 0,
+        "mean_error": 0.0,
+        "ewma_error": 0.0,
+        "confidence": "LOW",
+    }
+
     if not errors:
-        return {"correction": 0.0, "n_samples": 0, "mean_error": 0.0,
-                "ewma_error": 0.0, "confidence": "LOW"}
-    
-    # Sort by date
-    errors.sort(key=lambda e: e["target_date"])
-    
-    # Calculate mean error (positive = model underpredicts, negative = overpredicts)
+        return empty
+
     raw_errors = [e["error"] for e in errors]
-    mean_error = np.mean(raw_errors)
-    
-    # EWMA: more weight to recent errors
-    alpha = 0.3  # Smoothing factor
-    ewma = raw_errors[0]
-    for err in raw_errors[1:]:
-        ewma = alpha * err + (1 - alpha) * ewma
-    
-    # Correction = the error direction (add to prediction to fix bias)
-    correction = ewma
-    
-    # Confidence based on sample size
-    n = len(errors)
-    if n >= 7:
+    global_mean = float(np.mean(raw_errors))
+    global_ewma = _ewma(raw_errors)
+    n_global = len(errors)
+
+    # --- Try range-specific correction ---
+    range_correction = None
+    range_label = None
+    n_range = 0
+    range_ewma = 0.0
+    range_mean = 0.0
+
+    if predicted_mean is not None:
+        ranges = HIGH_RANGES if temp_type == "high" else LOW_RANGES
+        range_label = _get_range_label(predicted_mean, ranges)
+
+        range_errors = [
+            e["error"] for e in errors
+            if e.get("pred_range") == range_label
+        ]
+
+        # Fallback: also accept entries that only have predicted_mean (older logs)
+        if len(range_errors) < min_samples_range:
+            range_errors = [
+                e["error"] for e in errors
+                if _get_range_label(e.get("predicted_mean", -999), ranges) == range_label
+            ]
+
+        n_range = len(range_errors)
+        if n_range >= min_samples_range:
+            range_mean = float(np.mean(range_errors))
+            range_ewma = _ewma(range_errors)
+            range_correction = range_ewma
+
+    # --- Decide which correction to use ---
+    if range_correction is not None:
+        correction = range_correction
+        source = "range"
+        n_used = n_range
+        mean_error = range_mean
+        ewma_error = range_ewma
+    elif n_global >= min_samples_global:
+        correction = global_ewma
+        source = "global"
+        n_used = n_global
+        mean_error = global_mean
+        ewma_error = global_ewma
+        range_label = None
+    else:
+        return empty
+
+    # Cap to prevent over-correction (slightly tighter for range-specific)
+    max_abs = 1.8 if source == "range" else 2.0
+    correction = float(np.clip(correction, -max_abs, max_abs))
+
+    # Confidence
+    if n_used >= 8:
         confidence = "HIGH"
-    elif n >= 4:
+    elif n_used >= 4:
         confidence = "MEDIUM"
     else:
         confidence = "LOW"
-    
-    # Cap correction at ±2°C to avoid overcorrection
-    correction = np.clip(correction, -2.0, 2.0)
-    
+
     return {
-        "correction": round(float(correction), 2),
-        "n_samples": n,
-        "mean_error": round(float(mean_error), 2),
-        "ewma_error": round(float(ewma), 2),
+        "correction": round(correction, 2),
+        "source": source,
+        "range_label": range_label,
+        "n_samples": n_used,
+        "n_global": n_global,
+        "mean_error": round(mean_error, 2),
+        "ewma_error": round(ewma_error, 2),
         "confidence": confidence,
     }
 
 
-def apply_bias_correction(predictions, temp_type):
+def apply_bias_correction(predictions: dict, temp_type: str) -> float:
     """
-    Apply bias correction to prediction mean.
-    
+    Apply range-aware bias correction to a prediction mean.
+
     Args:
-        predictions: Dict with prediction data
+        predictions: Dict that must contain either:
+            - f"{temp_type}_mean"  (e.g. "high_mean")
+            - or "mean"
         temp_type: 'high' or 'low'
-    
+
     Returns:
-        Corrected mean temperature
+        Corrected mean temperature (float) or original if no correction available.
     """
     key = f"{temp_type}_mean"
     original_mean = predictions.get(key)
-    
+    if original_mean is None:
+        original_mean = predictions.get("mean")
+
     if original_mean is None:
         return original_mean
-    
-    bias = get_bias_correction(temp_type)
-    corrected_mean = original_mean + bias["correction"]
-    
-    return round(corrected_mean, 2)
+
+    bias = get_bias_correction(temp_type, predicted_mean=float(original_mean))
+    corrected = float(original_mean) + bias["correction"]
+    return round(corrected, 2)
 
 
-def get_bias_report():
+def get_bias_report(lookback_days: int = 30) -> dict:
     """
-    Generate a human-readable bias report for both high and low temps.
-    
-    Returns dict with 'high' and 'low' keys containing bias stats.
+    Generate a detailed bias report (global + per-range) for both high and low.
     """
     report = {}
-    
+
     for temp_type in ["high", "low"]:
-        bias = get_bias_correction(temp_type, lookback_days=30)
+        errors = _load_recent_errors(temp_type, lookback_days)
+        ranges = HIGH_RANGES if temp_type == "high" else LOW_RANGES
+
+        # Global
+        global_bias = get_bias_correction(temp_type, predicted_mean=None, lookback_days=lookback_days)
+
+        # Per-range
+        range_stats = {}
+        for label, lo, hi in ranges:
+            # Pick a representative mid-point for the range so get_bias_correction uses it
+            mid = 25.0 if lo == -999 else (39.0 if hi == 999 else (lo + hi) / 2)
+            b = get_bias_correction(temp_type, predicted_mean=mid, lookback_days=lookback_days)
+
+            if b["source"] == "range":
+                range_stats[label] = {
+                    "correction": b["correction"],
+                    "n_samples": b["n_samples"],
+                    "mean_error": b["mean_error"],
+                    "confidence": b["confidence"],
+                    "direction": (
+                        "underpredicts" if b["mean_error"] > 0.15
+                        else "overpredicts" if b["mean_error"] < -0.15
+                        else "calibrated"
+                    ),
+                }
+
         report[temp_type] = {
-            "correction": bias["correction"],
-            "mean_error": bias["mean_error"],
-            "ewma_error": bias["ewma_error"],
-            "n_samples": bias["n_samples"],
-            "confidence": bias["confidence"],
-            "direction": "underpredicts" if bias["mean_error"] > 0.2 else 
-                         "overpredicts" if bias["mean_error"] < -0.2 else "calibrated",
+            "global": {
+                "correction": global_bias["correction"],
+                "n_samples": global_bias["n_samples"],
+                "mean_error": global_bias["mean_error"],
+                "confidence": global_bias["confidence"],
+                "direction": (
+                    "underpredicts" if global_bias["mean_error"] > 0.15
+                    else "overpredicts" if global_bias["mean_error"] < -0.15
+                    else "calibrated"
+                ),
+            },
+            "by_range": range_stats,
         }
-    
+
     return report
 
 
-def format_bias_summary():
-    """Format bias report into a readable summary string."""
-    report = get_bias_report()
-    
-    lines = ["Bias Correction (Last 30 Days):"]
+def format_bias_summary(lookback_days: int = 30) -> str:
+    """Human-readable bias summary (global + range breakdown)."""
+    report = get_bias_report(lookback_days)
+    lines = [f"Bias Correction (Last {lookback_days} Days) — Range-Aware:"]
+
     for temp_type in ["high", "low"]:
-        b = report[temp_type]
+        r = report[temp_type]
+        g = r["global"]
         label = temp_type.upper()
-        if b["n_samples"] == 0:
+
+        if g["n_samples"] == 0:
             lines.append(f"  {label}: No data yet")
+            continue
+
+        lines.append(
+            f"  {label} GLOBAL: {g['direction']} by {abs(g['mean_error']):.2f}°C "
+            f"(n={g['n_samples']}, corr={g['correction']:+.2f}°C, {g['confidence']})"
+        )
+
+        if r["by_range"]:
+            for rng, stats in r["by_range"].items():
+                lines.append(
+                    f"    └ {rng}: {stats['direction']} "
+                    f"(n={stats['n_samples']}, corr={stats['correction']:+.2f}°C, {stats['confidence']})"
+                )
         else:
-            direction = b["direction"]
-            lines.append(
-                f"  {label}: {direction} by {abs(b['mean_error']):.2f}°C "
-                f"(n={b['n_samples']}, correction={b['correction']:+.2f}°C, "
-                f"confidence={b['confidence']})"
-            )
-    
+            lines.append("    └ (not enough per-range samples yet)")
+
     return "\n".join(lines)
+
+
+# ------------------------------------------------------------------
+# Convenience helpers for backtest / live use
+# ------------------------------------------------------------------
+
+def correct_mean(temp_type: str, predicted_mean: float, lookback_days: int = 30) -> float:
+    """One-liner: return bias-corrected mean."""
+    bias = get_bias_correction(temp_type, predicted_mean=predicted_mean, lookback_days=lookback_days)
+    return round(float(predicted_mean) + bias["correction"], 2)
+
+
+def get_correction_detail(temp_type: str, predicted_mean: float) -> dict:
+    """Return full correction info for logging / Telegram alerts."""
+    return get_bias_correction(temp_type, predicted_mean=predicted_mean)
