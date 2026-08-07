@@ -11,6 +11,8 @@ Improvements v2:
 import sys
 import io
 import re
+import json
+import time
 import logging
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -463,7 +465,7 @@ def get_ensemble_nwp_forecast(lat=22.3167, lon=114.1667):
             }
         }
     except Exception as e:
-        logger.warning(f"Error fetching ensemble NWP: {e}")
+        logger.debug(f"Error fetching ensemble NWP (non-critical): {e}")
         return None
 
 
@@ -471,222 +473,276 @@ def get_ensemble_nwp_forecast(lat=22.3167, lon=114.1667):
 
 def format_message(target_date, predictions, market_prices, actual_temps):
     """Format prediction + market data into Telegram message."""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    from zoneinfo import ZoneInfo
+
+    try:
+        generated_at = datetime.now(ZoneInfo("Asia/Hong_Kong"))
+    except Exception:
+        generated_at = datetime.now()
+
+    now = generated_at.strftime("%Y-%m-%d %H:%M HKT")
     date_str = target_date.strftime("%Y-%m-%d")
-    
-    lines = [f"🌡️ *HK Weather Alert* — {now}", ""]
-    lines.append(f"📅 *Target: {date_str}*")
-    
-    # Check if resolved
+
+    def _format_temp_display(value):
+        if value is None:
+            return "?"
+        try:
+            return f"{int(round(float(value)))}°C"
+        except (TypeError, ValueError):
+            return str(value)
+
+    def _contract_label(bucket_label):
+        bucket_text = str(bucket_label).strip()
+        match = re.search(r"(\d+)", bucket_text)
+        if match:
+            return f"{int(match.group(1))}°C"
+        return bucket_text
+
+    def _contract_temp_value(bucket_label):
+        bucket_text = str(bucket_label).strip()
+        match = re.search(r"(\d+)", bucket_text)
+        if match:
+            return int(match.group(1))
+        return 0
+
+    def _temp_sort_key(bucket_item):
+        return _contract_temp_value(bucket_item[0])
+
+    def _format_cents(price):
+        if price is None:
+            return "?¢"
+        try:
+            return f"{int(round(float(price) * 100))}¢"
+        except (TypeError, ValueError):
+            return "?¢"
+
+    def _format_percent(value):
+        if value is None:
+            return None
+        try:
+            return f"{float(value):+.1%}"
+        except (TypeError, ValueError):
+            return None
+
+    def _format_model_market_line(model_prob, market_prob):
+        return f"Model {model_prob:.0%} | Market {market_prob:.0%}"
+
+    def _get_bias_report():
+        try:
+            from bias_corrector import get_bias_report
+            return get_bias_report()
+        except Exception:
+            return {
+                "high": {"correction": 0.0, "n_samples": 0},
+                "low": {"correction": 0.0, "n_samples": 0},
+            }
+
+    def _market_price_for_label(label, market_map):
+        if not market_map:
+            return None
+        if label in market_map:
+            return market_map[label]
+        label_num = re.search(r"(\d+)", label)
+        label_num = label_num.group(1) if label_num else None
+        if label_num:
+            for market_label, price in market_map.items():
+                market_text = str(market_label)
+                market_num = re.search(r"(\d+)", market_text)
+                if market_num and market_num.group(1) == label_num:
+                    return price
+        return None
+
+    def _value_rating(edge):
+        if edge >= 0.10:
+            return "Strong Value"
+        if edge >= 0.05:
+            return "Moderate Value"
+        return "Low Value"
+
+    def _recommendation_markers(label, best_main, best_lottery):
+        markers = []
+        if best_main and _contract_label(best_main["bucket"]) == label:
+            markers.append("MAIN")
+        if best_lottery and _contract_label(best_lottery["bucket"]) == label:
+            markers.append("LOTTERY")
+        return markers
+
+    def _format_expected_value(bet):
+        ev = bet.get("ev") if isinstance(bet, dict) else None
+        if ev is None:
+            return None
+        try:
+            return f"Expected Value: {float(ev):+.1%}"
+        except (TypeError, ValueError):
+            return None
+
+    def _format_value_tag(edge):
+        try:
+            edge_value = float(edge)
+        except (TypeError, ValueError):
+            return None
+        if abs(edge_value) < 0.01:
+            return "⚪ FAIR VALUE"
+        if edge_value > 0:
+            return "🟢 UNDERPRICED"
+        return "🔴 OVERPRICED"
+
+    lines = ["🌡️ HK WEATHER ALERT", "", f"Generated:", now, "", f"📅 Target: {date_str}"]
+
     is_resolved, _ = check_if_resolved(market_prices, date_str)
-    
-    if is_resolved and actual_temps:
-        lines.append("✅ *RESOLVED*")
-        lines.append(f"Actual: High {actual_temps[0]}°C / Low {actual_temps[1]}°C")
-    else:
-        lines.append("⏳ *PENDING* (monitoring until resolved)")
-        forecast = predictions.get("forecast", {})
-        lines.append(f"HKO Forecast: High {forecast.get('max_temp', '?')}°C / Low {forecast.get('min_temp', '?')}°C")
-    
-    lines.append("")
+    status = "RESOLVED" if is_resolved and actual_temps else "PENDING"
+    lines.append(f"⏳ Status: {status}")
+    lines.extend(["", "🌤 Forecast", ""])
 
-    # High temp
-    lines.append("🔴 *HIGH Temperature:*")
+    forecast = predictions.get("forecast", {})
+    lines.append(f"High: {_format_temp_display(forecast.get('max_temp'))}")
+    lines.append(f"Low : {_format_temp_display(forecast.get('min_temp'))}")
+    lines.extend(["", "Bias Correction", ""])
+
+    bias_report = _get_bias_report()
+    lines.append(f"High: {bias_report.get('high', {}).get('correction', 0.0):+,.1f}°C".replace(",", ""))
+    lines.append(f"Low : {bias_report.get('low', {}).get('correction', 0.0):+,.1f}°C".replace(",", ""))
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━")
+
     high_probs = predictions.get("high_probs", {})
-    sorted_high = sorted(high_probs.items(), key=lambda x: x[1], reverse=True)
-
-    market_key = f"{date_str}_highest"
-    market_high = market_prices.get(market_key, {}).get("prices", {})
-
-    # Determine winning bucket if resolved
-    winning_high = None
-    if actual_temps and actual_temps[0] is not None:
-        actual_max = actual_temps[0]
-        for label, lo, hi in DEFAULT_HIGH_TEMP_BUCKETS:
-            if lo <= actual_max < hi:
-                winning_high = label
-                break
-
-    for bucket, prob in sorted_high[:7]:
-        market_price = None
-        for mk, mp in market_high.items():
-            if bucket.split("°")[0] in mk or mk.split("°")[0] in bucket:
-                market_price = mp
-                break
-
-        is_winner = bucket == winning_high if winning_high else False
-        
-        if market_price is not None:
-            edge = prob - market_price
-            if is_winner:
-                edge_str = f"🏆 WINNER"
-            elif edge > 0.05:
-                edge_str = f"✅ {edge:+.1%}"
-            else:
-                edge_str = f"⚪ {edge:+.1%}"
-            lines.append(f"  {bucket:<18} Model: {prob:.0%} | Market: {market_price:.0%} | {edge_str}")
-        else:
-            if is_winner:
-                lines.append(f"  {bucket:<18} Model: {prob:.0%} | 🏆 WINNER")
-            else:
-                lines.append(f"  {bucket:<18} Model: {prob:.0%}")
-
-    lines.append("")
-
-    # Low temp
-    lines.append("🔵 *LOW Temperature:*")
     low_probs = predictions.get("low_probs", {})
-    sorted_low = sorted(low_probs.items(), key=lambda x: x[1], reverse=True)
+    market_key_high = f"{date_str}_highest"
+    market_key_low = f"{date_str}_lowest"
+    market_high = market_prices.get(market_key_high, {}).get("prices", {})
+    market_low = market_prices.get(market_key_low, {}).get("prices", {})
 
-    market_key = f"{date_str}_lowest"
-    market_low = market_prices.get(market_key, {}).get("prices", {})
-
-    winning_low = None
-    if actual_temps and actual_temps[1] is not None:
-        actual_min = actual_temps[1]
-        for label, lo, hi in DEFAULT_LOW_TEMP_BUCKETS:
-            if lo <= actual_min < hi:
-                winning_low = label
-                break
-
-    for bucket, prob in sorted_low[:7]:
-        market_price = None
-        for mk, mp in market_low.items():
-            if bucket.split("°")[0] in mk or mk.split("°")[0] in bucket:
-                market_price = mp
-                break
-
-        is_winner = bucket == winning_low if winning_low else False
-        
-        if market_price is not None:
-            edge = prob - market_price
-            if is_winner:
-                edge_str = f"🏆 WINNER"
-            elif edge > 0.05:
-                edge_str = f"✅ {edge:+.1%}"
-            else:
-                edge_str = f"⚪ {edge:+.1%}"
-            lines.append(f"  {bucket:<18} Model: {prob:.0%} | Market: {market_price:.0%} | {edge_str}")
-        else:
-            if is_winner:
-                lines.append(f"  {bucket:<18} Model: {prob:.0%} | 🏆 WINNER")
-            else:
-                lines.append(f"  {bucket:<18} Model: {prob:.0%}")
-
-    lines.append("")
-    
-    # RECOMMENDED BETS (only if not resolved)
     best_bets = {"high": {"main": None, "lottery": None}, "low": {"main": None, "lottery": None}}
     if not is_resolved:
         best_bets = find_recommended_bets(predictions, market_prices, date_str)
-        
-        lines.append("🎯 *RECOMMENDED BETS:*")
+
+    def _best_for_side(side):
+        return best_bets.get(side, {"main": None, "lottery": None})
+
+    def _side_market(side):
+        return market_high if side == "high" else market_low
+
+    def _side_probs(side):
+        return high_probs if side == "high" else low_probs
+
+    lines.extend(["", "🎯 MAIN BETS", ""])
+    for side, emoji, title in [("high", "🔴", "HIGH"), ("low", "🔵", "LOW")]:
+        best_side = _best_for_side(side)
+        main_bet = best_side.get("main")
+        lines.append(f"{emoji} {title}")
         lines.append("")
-        
-        # HIGH recommendations
-        lines.append("  🔴 *HIGH:*")
-        if best_bets["high"]["main"]:
-            b = best_bets["high"]["main"]
-            kelly = b.get("kelly_stake", 0)
-            # Check if main bet is underpriced
-            if b["edge"] > 0:
-                lines.append(f"     📌 Main: {b['bucket']} @ {b['market']:.0%} 💎")
-                lines.append(f"        Model: {b['model']:.0%} | Edge: {b['edge']:+.1%} | UNDERPRICED!")
-                if kelly > 0:
-                    lines.append(f"        💵 Kelly stake: ${kelly:.2f}")
+        if main_bet:
+            market_map = _side_market(side)
+            display_label = _contract_label(main_bet["bucket"])
+            lines.append(f"Buy YES {display_label} @ {_format_cents(main_bet['market'])}")
+            lines.append("")
+            lines.append(f"Model {main_bet['model']:.0%} | Market {main_bet['market']:.0%}")
+            ev_line = _format_expected_value(main_bet)
+            if ev_line:
+                lines.append(f"Edge {_format_percent(main_bet['edge'])} | {ev_line}")
             else:
-                lines.append(f"     📌 Main: {b['bucket']} @ {b['market']:.0%}")
-                lines.append(f"        Model: {b['model']:.0%} | Edge: {b['edge']:+.1%}")
+                lines.append(f"Edge {_format_percent(main_bet['edge'])}")
+            value_tag = _format_value_tag(main_bet.get('edge'))
+            if value_tag:
+                lines.append(value_tag)
+            lines.append(f"Kelly ${main_bet.get('kelly_stake', 0.0):.2f}")
         else:
-            lines.append("     📌 Main: No suitable bet")
-        
-        if best_bets["high"]["lottery"]:
-            b = best_bets["high"]["lottery"]
-            kelly = b.get("kelly_stake", 0)
-            lines.append(f"     🎰 Lottery: {b['bucket']} @ {b['market']:.0%}")
-            lines.append(f"        Model: {b['model']:.0%} | Edge: {b['edge']:+.1%} | {b['confidence']}")
-            if kelly > 0:
-                lines.append(f"        💵 Kelly stake: ${kelly:.2f}")
-        else:
-            lines.append("     🎰 Lottery: No value bet found")
-        
-        lines.append("")
-        
-        # LOW recommendations
-        lines.append("  🔵 *LOW:*")
-        if best_bets["low"]["main"]:
-            b = best_bets["low"]["main"]
-            kelly = b.get("kelly_stake", 0)
-            # Check if main bet is underpriced
-            if b["edge"] > 0:
-                lines.append(f"     📌 Main: {b['bucket']} @ {b['market']:.0%} 💎")
-                lines.append(f"        Model: {b['model']:.0%} | Edge: {b['edge']:+.1%} | UNDERPRICED!")
-                if kelly > 0:
-                    lines.append(f"        💵 Kelly stake: ${kelly:.2f}")
-            else:
-                lines.append(f"     📌 Main: {b['bucket']} @ {b['market']:.0%}")
-                lines.append(f"        Model: {b['model']:.0%} | Edge: {b['edge']:+.1%}")
-        else:
-            lines.append("     📌 Main: No suitable bet")
-        
-        if best_bets["low"]["lottery"]:
-            b = best_bets["low"]["lottery"]
-            kelly = b.get("kelly_stake", 0)
-            lines.append(f"     🎰 Lottery: {b['bucket']} @ {b['market']:.0%}")
-            lines.append(f"        Model: {b['model']:.0%} | Edge: {b['edge']:+.1%} | {b['confidence']}")
-            if kelly > 0:
-                lines.append(f"        💵 Kelly stake: ${kelly:.2f}")
-        else:
-            lines.append("     🎰 Lottery: No value bet found")
-        
-        lines.append("")
-        lines.append("  _📌 Main = sesuai forecast | 🎰 Lottery = underpriced | 💎 = main also underpriced_")
-        lines.append("  _💵 Kelly stake = optimal bet size (quarter-Kelly, bankroll=${})_".format(int(BANKROLL)))
+            lines.append("No main bet found.")
         lines.append("")
 
-    # Other value bets
-    if not is_resolved:
-        lines.append("💰 *Other Value Bets:*")
-        all_bets = find_best_bets(predictions, market_prices, date_str)
-        # Exclude the recommended bets
-        other_bets = []
-        for b in all_bets:
-            is_recommended = False
-            if best_bets["high"]["main"] and b["bucket"] == best_bets["high"]["main"]["bucket"] and b["type"] == "HIGH":
-                is_recommended = True
-            if best_bets["high"]["lottery"] and b["bucket"] == best_bets["high"]["lottery"]["bucket"] and b["type"] == "HIGH":
-                is_recommended = True
-            if best_bets["low"]["main"] and b["bucket"] == best_bets["low"]["main"]["bucket"] and b["type"] == "LOW":
-                is_recommended = True
-            if best_bets["low"]["lottery"] and b["bucket"] == best_bets["low"]["lottery"]["bucket"] and b["type"] == "LOW":
-                is_recommended = True
-            if not is_recommended:
-                other_bets.append(b)
-        
-        if other_bets:
-            for bet in other_bets[:4]:
-                lines.append(f"  {bet['emoji']} {bet['bucket']} — "
-                            f"Model: {bet['model']:.0%} vs Market: {bet['market']:.0%} "
-                            f"(Edge: {bet['edge']:+.1%})")
-        else:
-            lines.append("  Tidak ada value bet lain.")
-
+    lines.append("━━━━━━━━━━━━━━")
     lines.append("")
-    lines.append("_🎯 = recommended | Edge = Model - Market_")
-    
-    # Add bias correction summary
-    from bias_corrector import get_bias_report
-    bias_report = get_bias_report()
-    bias_parts = []
-    for ttype in ["high", "low"]:
-        b = bias_report[ttype]
-        if b["n_samples"] > 0:
-            bias_parts.append(f"{ttype.upper()}: {b['correction']:+.2f}°C")
-    if bias_parts:
-        lines.append(f"_Bias correction: {' | '.join(bias_parts)} (n={bias_report['high']['n_samples']+bias_report['low']['n_samples']})_")
+    lines.append("🎰 LOTTERY BETS")
+    lines.append("")
+    for side, emoji, title in [("high", "🔴", "HIGH"), ("low", "🔵", "LOW")]:
+        best_side = _best_for_side(side)
+        lottery_bet = best_side.get("lottery")
+        lines.append(f"{emoji} {title}")
+        lines.append("")
+        if lottery_bet:
+            display_label = _contract_label(lottery_bet["bucket"])
+            lines.append(f"Buy YES {display_label} @ {_format_cents(lottery_bet['market'])}")
+            lines.append("")
+            lines.append(f"Model {lottery_bet['model']:.0%} | Market {lottery_bet['market']:.0%}")
+            lines.append(f"Edge {_format_percent(lottery_bet['edge'])}")
+        else:
+            lines.append("No lottery value bet found.")
+        lines.append("")
+
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append("")
+    lines.append("💎 OTHER VALUE BETS")
+    lines.append("")
+
+    all_bets = find_best_bets(predictions, market_prices, date_str)
+    excluded = set()
+    for side in ("high", "low"):
+        for key in ("main", "lottery"):
+            bet = best_bets.get(side, {}).get(key)
+            if bet:
+                excluded.add((side.upper(), _contract_label(bet["bucket"])))
+
+    for side, side_label in [("HIGH", "high"), ("LOW", "low")]:
+        side_bets = [
+            b for b in all_bets
+            if b.get("type") == side and (side, _contract_label(b["bucket"])) not in excluded
+        ]
+        side_bets.sort(key=lambda b: b.get("edge", 0), reverse=True)
+        side_bets = side_bets[:3]
+        lines.append(side)
+        if side_bets:
+            for bet in side_bets:
+                label = _contract_label(bet["bucket"])
+                lines.append(f"• {label} ({_format_percent(bet['edge'])})")
+        else:
+            lines.append("• None")
+        lines.append("")
+
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append("")
+    lines.append("📊 FULL BUCKET PROBABILITIES")
+    lines.append("")
+
+    best_high_main = best_bets["high"].get("main")
+    best_high_lottery = best_bets["high"].get("lottery")
+    best_low_main = best_bets["low"].get("main")
+    best_low_lottery = best_bets["low"].get("lottery")
+
+    for side, bucket_defs, probs, market_map, best_main, best_lottery in [
+        ("HIGH", DEFAULT_HIGH_TEMP_BUCKETS, high_probs, market_high, best_high_main, best_high_lottery),
+        ("LOW", DEFAULT_LOW_TEMP_BUCKETS, low_probs, market_low, best_low_main, best_low_lottery),
+    ]:
+        lines.append(side)
+        lines.append("")
+        for bucket_def in sorted(bucket_defs, key=_temp_sort_key):
+            bucket_label = bucket_def[0]
+            display_label = _contract_label(bucket_label)
+            model_prob = probs.get(bucket_label)
+            if model_prob is None:
+                # fallback for any bucket label format mismatch
+                for key, value in probs.items():
+                    if _contract_label(key) == display_label:
+                        model_prob = value
+                        break
+            model_prob = model_prob if model_prob is not None else 0.0
+            market_prob = _market_price_for_label(display_label, market_map)
+            market_prob = market_prob if market_prob is not None else 0.0
+
+            prefix = ""
+            suffix = ""
+            if best_main and _contract_label(best_main["bucket"]) == display_label:
+                prefix = "👉 "
+                suffix = "  (MAIN)"
+            elif best_lottery and _contract_label(best_lottery["bucket"]) == display_label:
+                prefix = "⭐ "
+                suffix = "  (LOTTERY)"
+
+            lines.append(
+                f"{prefix}{display_label}  Model {model_prob:.0%} | Market {market_prob:.0%}{suffix}"
+            )
+        lines.append("")
 
     return "\n".join(lines)
-
 
 def find_recommended_bets(predictions, market_prices, date_str):
     """
@@ -866,161 +922,462 @@ def send_telegram(message):
         print(f"[ERR] Telegram send error: {e}")
 
 
-def run():
-    """Main execution: predict tomorrow + fetch prices + send Telegram."""
+def build_prediction_snapshot(
+    target_date,
+    status,
+    forecast_high,
+    forecast_low,
+    bias_high,
+    bias_low,
+    predictions,
+    market_prices,
+    high_bucket_defs,
+    low_bucket_defs,
+):
+    """Build a structured snapshot from existing prediction outputs."""
+    try:
+        from zoneinfo import ZoneInfo
+        generated_at = datetime.now(ZoneInfo("Asia/Hong_Kong"))
+    except Exception:
+        generated_at = datetime.now()
+
+    def _contract_label(bucket_label):
+        bucket_text = str(bucket_label).strip()
+        match = re.search(r"(\d+)", bucket_text)
+        if match:
+            return f"{int(match.group(1))}°C"
+        return bucket_text
+
+    def _market_section(date_str, side):
+        key = f"{date_str}_{'highest' if side == 'high' else 'lowest'}"
+        return market_prices.get(key, {}).get("prices", {})
+
+    def _contract_market_price(label, market_map):
+        if label in market_map:
+            return market_map[label]
+        label_num = re.search(r"(\d+)", label)
+        label_num = label_num.group(1) if label_num else None
+        if label_num:
+            for market_label, price in market_map.items():
+                market_text = str(market_label)
+                market_num = re.search(r"(\d+)", market_text)
+                if market_num and market_num.group(1) == label_num:
+                    return price
+        return None
+
+    def _bucket_sort_key(bucket_def):
+        match = re.search(r"(\d+)", str(bucket_def[0]))
+        return int(match.group(1)) if match else 0
+
+    date_str = target_date.strftime("%Y-%m-%d")
+    recommendations = find_recommended_bets(predictions, market_prices, date_str)
+    high_probs = predictions.get("high_probs", {})
+    low_probs = predictions.get("low_probs", {})
+    high_market = _market_section(date_str, "high")
+    low_market = _market_section(date_str, "low")
+
+    def _pick_best(side_key, kind):
+        bet = recommendations.get(side_key, {}).get(kind)
+        if not bet:
+            return None
+        return _contract_label(bet["bucket"])
+
+    def _contract_entry(label, side_key, market_map, probs, main_label, lottery_label):
+        model_prob = probs.get(label)
+        if model_prob is None:
+            for key, value in probs.items():
+                if _contract_label(key) == label:
+                    model_prob = value
+                    break
+        model_prob = model_prob if model_prob is not None else 0.0
+        market_prob = _contract_market_price(label, market_map)
+        market_prob = market_prob if market_prob is not None else 0.0
+        edge = model_prob - market_prob
+        if label == main_label:
+            classification = "Main Bet"
+        elif label == lottery_label:
+            classification = "Lottery Bet"
+        elif edge > 0.05:
+            classification = "Other Value Bet"
+        else:
+            classification = "Not Recommended"
+
+        kelly = 0.0
+        for kind in ("main", "lottery"):
+            bet = recommendations.get(side_key, {}).get(kind)
+            if bet and _contract_label(bet["bucket"]) == label:
+                kelly = bet.get("kelly_stake", 0.0)
+                break
+
+        return {
+            "contract": label,
+            "model_probability": model_prob,
+            "market_probability": market_prob,
+            "edge": edge,
+            "ev": edge,
+            "kelly": kelly,
+            "classification": classification,
+        }
+
+    high_main_label = _pick_best("high", "main")
+    high_lottery_label = _pick_best("high", "lottery")
+    low_main_label = _pick_best("low", "main")
+    low_lottery_label = _pick_best("low", "lottery")
+
+    high_contracts = {}
+    for bucket_def in sorted(high_bucket_defs, key=_bucket_sort_key):
+        label = _contract_label(bucket_def[0])
+        high_contracts[label] = _contract_entry(
+            label,
+            "high",
+            high_market,
+            high_probs,
+            high_main_label,
+            high_lottery_label,
+        )
+
+    low_contracts = {}
+    for bucket_def in sorted(low_bucket_defs, key=_bucket_sort_key):
+        label = _contract_label(bucket_def[0])
+        low_contracts[label] = _contract_entry(
+            label,
+            "low",
+            low_market,
+            low_probs,
+            low_main_label,
+            low_lottery_label,
+        )
+
+    return {
+        "schema_version": 1,
+        "snapshot_id": generated_at.strftime("%Y%m%d_%H%M%S_%f"),
+        "timestamp": generated_at.isoformat(),
+        "target_date": date_str,
+        "status": status,
+        "forecast": {
+            "high": forecast_high,
+            "low": forecast_low,
+            "bias_high": bias_high.get("correction") if isinstance(bias_high, dict) else bias_high,
+            "bias_low": bias_low.get("correction") if isinstance(bias_low, dict) else bias_low,
+        },
+        "recommendations": {
+            "high": {
+                "main_contract": high_main_label,
+                "lottery_contract": high_lottery_label,
+                "model_probability": (recommendations.get("high", {}).get("main") or {}).get("model"),
+                "market_probability": (recommendations.get("high", {}).get("main") or {}).get("market"),
+                "edge": (recommendations.get("high", {}).get("main") or {}).get("edge"),
+                "ev": (recommendations.get("high", {}).get("main") or {}).get("edge"),
+                "kelly": (recommendations.get("high", {}).get("main") or {}).get("kelly_stake", 0.0),
+            },
+            "low": {
+                "main_contract": low_main_label,
+                "lottery_contract": low_lottery_label,
+                "model_probability": (recommendations.get("low", {}).get("main") or {}).get("model"),
+                "market_probability": (recommendations.get("low", {}).get("main") or {}).get("market"),
+                "edge": (recommendations.get("low", {}).get("main") or {}).get("edge"),
+                "ev": (recommendations.get("low", {}).get("main") or {}).get("edge"),
+                "kelly": (recommendations.get("low", {}).get("main") or {}).get("kelly_stake", 0.0),
+            },
+        },
+        "market": {
+            "high": high_market,
+            "low": low_market,
+        },
+        "probabilities": {
+            "high": high_probs,
+            "low": low_probs,
+        },
+        "contracts": {
+            "high": high_contracts,
+            "low": low_contracts,
+        },
+    }
+
+
+def save_prediction_snapshot(snapshot):
+    """Append one snapshot to the JSONL history file."""
+    snapshot_path = PROCESSED_DATA_DIR / "prediction_snapshots.jsonl"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(snapshot_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(snapshot, ensure_ascii=False) + "\n")
+
+
+def _underpriced_alert_seen(date_str, hour_key, side):
+    """Check whether an underpriced alert was already sent for this hour and side."""
+    state_path = PROCESSED_DATA_DIR / "underpriced_alerts.jsonl"
+    if not state_path.exists():
+        return False
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("target_date") == date_str and record.get("hour_key") == hour_key and record.get("side") == side and record.get("alerted"):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _last_underpriced_edge(date_str, hour_key, side):
+    """Return the previous recorded edge for the same date/side before this hour."""
+    state_path = PROCESSED_DATA_DIR / "underpriced_alerts.jsonl"
+    if not state_path.exists():
+        return None
+    previous = None
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("target_date") != date_str or record.get("side") != side:
+                    continue
+                record_hour = record.get("hour_key")
+                if not record_hour or record_hour >= hour_key:
+                    continue
+                edge = record.get("edge")
+                if edge is None:
+                    continue
+                previous = edge
+    except OSError:
+        return None
+    return previous
+
+
+def _save_underpriced_alert(date_str, hour_key, side, edge, alerted):
+    """Append one underpriced-alert evaluation record to the history file."""
+    state_path = PROCESSED_DATA_DIR / "underpriced_alerts.jsonl"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "target_date": date_str,
+        "hour_key": hour_key,
+        "side": side,
+        "edge": edge,
+        "alerted": alerted,
+        "timestamp": datetime.now().isoformat(),
+    }
+    with open(state_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def run(target_dates=None):
+    """
+    Main execution: predict + fetch prices + send Telegram.
+    target_dates: optional list of date objects. Defaults to today (if unresolved) + tomorrow.
+    """
     print("=" * 60)
     print("  HK Weather Prediction Alert v2")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
 
-    # Target: tomorrow only
     today = datetime.now().date()
-    target_date = today + timedelta(days=1)
-    date_str = target_date.strftime("%Y-%m-%d")
-    
-    print(f"\n  Target date: {date_str}")
 
-    # Get recent data (1 year for DOY matching)
+    # Collect shared data once
     print("\n[1/7] Fetching recent temperature data...")
     recent = get_recent_data(365)
-    print(f"  {len(recent)} days of data loaded")
+    print(f"  {len(recent)} days of data loaded\n")
 
-    # Get HKO forecast
-    print("\n[2/7] Fetching HKO 9-day forecast...")
+    print("[2/7] Fetching HKO 9-day forecast...")
     forecasts = get_hko_forecast()
-    print(f"  {len(forecasts)} days of forecast loaded")
+    print(f"  {len(forecasts)} days of forecast loaded\n")
 
-    # Improvement #5: Get ensemble NWP forecast
-    print("\n[3/7] Fetching ensemble NWP forecast...")
+    print("[3/7] Fetching ensemble NWP forecast...")
     ensemble_nwp = get_ensemble_nwp_forecast()
     if ensemble_nwp:
         print(f"  Ensemble NWP loaded: {len(ensemble_nwp['max']['members'])} members")
         print(f"  Max temp: {ensemble_nwp['max']['mean']:.1f}°C ± {ensemble_nwp['max']['std']:.1f}°C")
         print(f"  Min temp: {ensemble_nwp['min']['mean']:.1f}°C ± {ensemble_nwp['min']['std']:.1f}°C")
     else:
-        print("  Ensemble NWP not available, using HKO only")
+        print("  Ensemble NWP not available, using HKO only\n")
 
-    # Check if already resolved (actual temperature available)
-    print("\n[4/7] Checking if event is resolved...")
-    actual_max, actual_min = get_actual_temperature(target_date)
-    if actual_max is not None:
-        print(f"  RESOLVED: High {actual_max}°C, Low {actual_min}°C")
-        # Update performance tracker
-        if actual_max is not None:
-            update_prediction(date_str, "high", actual_max)
-        if actual_min is not None:
-            update_prediction(date_str, "low", actual_min)
-        
-        # Improvement #6: Log forecast errors for bias correction
-        # We need yesterday's prediction mean to compute the error
-        # Use the blended forecast from the prediction
-    else:
-        print(f"  Event not yet resolved")
-
-    # Get Polymarket prices
-    print("\n[5/7] Fetching Polymarket market prices...")
+    print("[5/7] Fetching Polymarket market prices...")
     market_prices = get_market_prices()
-    print(f"  {len(market_prices)} events found")
+    print(f"  {len(market_prices)} events found\n")
 
-    # Improvement #1: Extract dynamic bucket ranges
-    print("\n[6/7] Extracting dynamic bucket ranges...")
-    high_bucket_defs = extract_dynamic_buckets(market_prices, date_str, "highest")
-    low_bucket_defs = extract_dynamic_buckets(market_prices, date_str, "lowest")
-    print(f"  HIGH buckets: {len(high_bucket_defs)} ({high_bucket_defs[0][0]} to {high_bucket_defs[-1][0]})")
-    print(f"  LOW buckets: {len(low_bucket_defs)} ({low_bucket_defs[0][0]} to {low_bucket_defs[-1][0]})")
+    # Determine target dates
+    if target_dates is None:
+        target_dates = []
+        for offset in [0, 1]:
+            d = today + timedelta(days=offset)
+            ds = d.strftime("%Y-%m-%d")
+            if f"{ds}_highest" in market_prices or f"{ds}_lowest" in market_prices:
+                target_dates.append(d)
 
-    # Generate predictions for tomorrow
-    print("\n[7/7] Generating predictions...")
-    
-    # Find HKO forecast for target date
-    target_forecast = None
-    for fc in forecasts:
-        if fc["date"].date() == target_date:
-            target_forecast = fc
-            break
-    
-    # Blend HKO forecast with ensemble NWP if available
-    if target_forecast:
-        hko_max = target_forecast["max_temp"]
-        hko_min = target_forecast["min_temp"]
-        
-        if ensemble_nwp:
-            # 60% HKO + 40% Ensemble NWP mean
-            max_fc = 0.6 * hko_max + 0.4 * ensemble_nwp["max"]["mean"]
-            min_fc = 0.6 * hko_min + 0.4 * ensemble_nwp["min"]["mean"]
-            print(f"  Blended Forecast: High {max_fc:.1f}°C / Low {min_fc:.1f}°C (HKO + NWP)")
+    if not target_dates:
+        print("  No active Polymarket events found for requested date(s).")
+        return
+
+    for target_date in target_dates:
+        date_str = target_date.strftime("%Y-%m-%d")
+        print(f"\n{'='*60}")
+        print(f"  Processing: {date_str}")
+        print(f"{'='*60}")
+
+        # Check if already resolved
+        print(f"\n[4/7] Checking if event is resolved...")
+        actual_max, actual_min = get_actual_temperature(target_date)
+        if actual_max is not None:
+            print(f"  RESOLVED: High {actual_max}°C, Low {actual_min}°C")
+            update_prediction(date_str, "high", actual_max)
+            update_prediction(date_str, "low", actual_min)
         else:
-            max_fc = hko_max
-            min_fc = hko_min
-            print(f"  HKO Forecast: High {max_fc}°C / Low {min_fc}°C")
-    else:
-        max_fc = None
-        min_fc = None
-        print(f"  No forecast available for {date_str}")
+            print(f"  Event not yet resolved\n")
 
-    # Improvement #6: Apply bias correction from recent errors
-    print("\n  Applying bias correction...")
-    bias_high = get_bias_correction("high")
-    bias_low = get_bias_correction("low")
-    if max_fc is not None and bias_high["n_samples"] > 0:
-        max_fc += bias_high["correction"]
-        print(f"  HIGH correction: {bias_high['correction']:+.2f}°C (n={bias_high['n_samples']}, {bias_high['confidence']})")
-    if min_fc is not None and bias_low["n_samples"] > 0:
-        min_fc += bias_low["correction"]
-        print(f"  LOW correction: {bias_low['correction']:+.2f}°C (n={bias_low['n_samples']}, {bias_low['confidence']})")
-    if bias_high["n_samples"] == 0 and bias_low["n_samples"] == 0:
-        print("  No bias data yet (will start learning after first resolved event)")
-    
-    # Predict high temp buckets using dynamic bucket definitions
-    high_probs, high_mean, high_std = predict_buckets(
-        'max', recent, target_date, forecast_temp=max_fc, bucket_defs=high_bucket_defs
-    )
-    # Predict low temp buckets using dynamic bucket definitions
-    low_probs, low_mean, low_std = predict_buckets(
-        'min', recent, target_date, forecast_temp=min_fc, bucket_defs=low_bucket_defs
-    )
+        # Extract dynamic bucket ranges for this date
+        print("[6/7] Extracting dynamic bucket ranges...")
+        high_bucket_defs = extract_dynamic_buckets(market_prices, date_str, "highest")
+        low_bucket_defs = extract_dynamic_buckets(market_prices, date_str, "lowest")
+        print(f"  HIGH buckets: {len(high_bucket_defs)} ({high_bucket_defs[0][0]} to {high_bucket_defs[-1][0]})")
+        print(f"  LOW buckets: {len(low_bucket_defs)} ({low_bucket_defs[0][0]} to {low_bucket_defs[-1][0]})\n")
 
-    predictions = {
-        "forecast": {"max_temp": max_fc, "min_temp": min_fc},
-        "high_probs": high_probs,
-        "low_probs": low_probs,
-        "high_mean": high_mean,
-        "low_mean": low_mean,
-        "ensemble_nwp": ensemble_nwp,
-    }
+        # Generate predictions
+        print("[7/7] Generating predictions...")
+        
+        # Find HKO forecast for target date
+        target_forecast = None
+        for fc in forecasts:
+            if fc["date"].date() == target_date:
+                target_forecast = fc
+                break
+        
+        # Blend HKO forecast with ensemble NWP if available
+        if target_forecast:
+            hko_max = target_forecast["max_temp"]
+            hko_min = target_forecast["min_temp"]
+            
+            if ensemble_nwp:
+                max_fc = 0.6 * hko_max + 0.4 * ensemble_nwp["max"]["mean"]
+                min_fc = 0.6 * hko_min + 0.4 * ensemble_nwp["min"]["mean"]
+                print(f"  Blended Forecast: High {max_fc:.1f}°C / Low {min_fc:.1f}°C (HKO + NWP)")
+            else:
+                max_fc = hko_max
+                min_fc = hko_min
+                print(f"  HKO Forecast: High {max_fc}°C / Low {min_fc}°C")
+        else:
+            max_fc = None
+            min_fc = None
+            print(f"  No forecast available for {date_str}")
 
-    best_high = max(high_probs, key=high_probs.get)
-    best_low = max(low_probs, key=low_probs.get)
-    print(f"\n  Prediction:")
-    print(f"    High: {best_high} ({high_probs[best_high]:.0%})")
-    print(f"    Low: {best_low} ({low_probs[best_low]:.0%})")
+        # Apply bias correction
+        print("\n  Applying bias correction...")
+        bias_high = get_bias_correction("high")
+        bias_low = get_bias_correction("low")
+        if max_fc is not None and bias_high["n_samples"] > 0:
+            max_fc += bias_high["correction"]
+            print(f"  HIGH correction: {bias_high['correction']:+.2f}°C (n={bias_high['n_samples']}, {bias_high['confidence']})")
+        if min_fc is not None and bias_low["n_samples"] > 0:
+            min_fc += bias_low["correction"]
+            print(f"  LOW correction: {bias_low['correction']:+.2f}°C (n={bias_low['n_samples']}, {bias_low['confidence']})")
+        if bias_high["n_samples"] == 0 and bias_low["n_samples"] == 0:
+            print("  No bias data yet (will start learning after first resolved event)")
+        
+        # Predict high temp buckets
+        high_probs, high_mean, high_std = predict_buckets(
+            'max', recent, target_date, forecast_temp=max_fc, bucket_defs=high_bucket_defs
+        )
+        # Predict low temp buckets
+        low_probs, low_mean, low_std = predict_buckets(
+            'min', recent, target_date, forecast_temp=min_fc, bucket_defs=low_bucket_defs
+        )
 
-    # Format and send message
-    actual_temps = (actual_max, actual_min) if actual_max is not None else None
-    message = format_message(target_date, predictions, market_prices, actual_temps)
-    
-    # Improvement #4: Log predictions for performance tracking
-    if actual_max is None:  # Only log if not resolved yet
-        best_bets = find_recommended_bets(predictions, market_prices, date_str)
-        log_prediction(date_str, "high", high_probs, best_bets.get("high", {}))
-        log_prediction(date_str, "low", low_probs, best_bets.get("low", {}))
-        print("\n  [OK] Predictions logged for performance tracking")
-    
-    # Improvement #6: Log forecast errors for resolved events (bias learning)
-    if actual_max is not None:
-        log_forecast_error(date_str, "high", high_mean, actual_max)
-        log_forecast_error(date_str, "low", low_mean, actual_min)
-        print("  [OK] Forecast errors logged for bias correction")
+        predictions = {
+            "forecast": {"max_temp": max_fc, "min_temp": min_fc},
+            "high_probs": high_probs,
+            "low_probs": low_probs,
+            "high_mean": high_mean,
+            "low_mean": low_mean,
+            "ensemble_nwp": ensemble_nwp,
+        }
 
-    try:
-        print(f"\n--- Message Preview ---")
-        print(message.encode('utf-8', errors='replace').decode('utf-8'))
-        print(f"--- End Preview ---\n")
-    except Exception:
-        print("\n--- Message Preview (encoding skipped) ---\n")
+        best_high = max(high_probs, key=high_probs.get)
+        best_low = max(low_probs, key=low_probs.get)
+        print(f"\n  Prediction:")
+        print(f"    High: {best_high} ({high_probs[best_high]:.0%})")
+        print(f"    Low: {best_low} ({low_probs[best_low]:.0%})")
 
-    send_telegram(message)
+        # Format message with date label
+        actual_temps = (actual_max, actual_min) if actual_max is not None else None
+        message = format_message(target_date, predictions, market_prices, actual_temps)
+
+        snapshot = build_prediction_snapshot(
+            target_date=target_date,
+            status="RESOLVED" if actual_max is not None else "PENDING",
+            forecast_high=max_fc,
+            forecast_low=min_fc,
+            bias_high=bias_high,
+            bias_low=bias_low,
+            predictions=predictions,
+            market_prices=market_prices,
+            high_bucket_defs=high_bucket_defs,
+            low_bucket_defs=low_bucket_defs,
+        )
+        save_prediction_snapshot(snapshot)
+        print(f"  [OK] Snapshot saved: {snapshot['snapshot_id']}")
+        
+        # Log predictions
+        if actual_max is None:
+            best_bets = find_recommended_bets(predictions, market_prices, date_str)
+            log_prediction(date_str, "high", high_probs, best_bets.get("high", {}))
+            log_prediction(date_str, "low", low_probs, best_bets.get("low", {}))
+            print("\n  [OK] Predictions logged for performance tracking")
+
+            alert_lines = []
+            hour_key = datetime.now().strftime("%Y-%m-%d-%H")
+            for side, label in [("high", "HIGH"), ("low", "LOW")]:
+                main_bet = best_bets.get(side, {}).get("main")
+                current_edge = float(main_bet.get("edge", 0)) if main_bet else 0.0
+                previous_edge = _last_underpriced_edge(date_str, hour_key, side)
+                previous_edge = float(previous_edge) if previous_edge is not None else None
+                should_alert = (
+                    main_bet
+                    and current_edge > 0.03
+                    and (previous_edge is not None and current_edge > previous_edge)
+                    and not _underpriced_alert_seen(date_str, hour_key, side)
+                )
+                _save_underpriced_alert(date_str, hour_key, side, current_edge, should_alert)
+                if should_alert and main_bet is not None:
+                    bucket = main_bet.get("bucket", "")
+                    market_cents = main_bet.get("market", 0) * 100
+                    alert_lines.append(
+                        f"🟢 UNDERPRICED ALERT {label} {bucket} @ {market_cents:.0f}¢ | Edge {current_edge:+.1%}"
+                    )
+
+            if alert_lines:
+                send_telegram("\n".join(alert_lines))
+                print("  [OK] Underpriced alert sent")
+        
+        if actual_max is not None:
+            log_forecast_error(date_str, "high", high_mean, actual_max)
+            log_forecast_error(date_str, "low", low_mean, actual_min)
+            print("  [OK] Forecast errors logged for bias correction")
+
+        try:
+            print(f"\n--- Message Preview ({date_str}) ---")
+            print(message.encode('utf-8', errors='replace').decode('utf-8'))
+            print(f"--- End Preview ---\n")
+        except Exception:
+            print("\n--- Message Preview (encoding skipped) ---\n")
+
+        send_telegram(message)
+        time.sleep(1)  # Small delay between sends
 
 
 if __name__ == "__main__":
-    run()
+    import sys
+    if len(sys.argv) > 1:
+        # Specific date mode: python telegram_alert.py 2026-08-10
+        from datetime import datetime as _dt
+        run(target_dates=[_dt.strptime(sys.argv[1], "%Y-%m-%d").date()])
+    else:
+        run()

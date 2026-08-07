@@ -139,5 +139,9 @@ def main():
     print("=" * 70)
 
 
+def test_pipeline():
+    """Alias for main() — for programmatic import."""
+    main()
+
 if __name__ == "__main__":
     main()

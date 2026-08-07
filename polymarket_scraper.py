@@ -62,6 +62,13 @@ class PolymarketScraper:
         Checks today + days_ahead days for both high and low temp markets.
         Returns list of event dicts from Gamma API.
         """
+        # Safety: ensure days_ahead is int
+        if isinstance(days_ahead, str):
+            try:
+                days_ahead = int(days_ahead)
+            except (ValueError, TypeError):
+                days_ahead = 10
+
         found = []
         today = date.today()
 
