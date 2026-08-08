@@ -718,50 +718,6 @@ def format_message(target_date, predictions, market_prices, actual_temps):
             lines.append("• None")
         lines.append("")
 
-    lines.append("━━━━━━━━━━━━━━")
-    lines.append("")
-    lines.append("📊 FULL BUCKET PROBABILITIES")
-    lines.append("")
-
-    best_high_main = best_bets["high"].get("main")
-    best_high_lottery = best_bets["high"].get("lottery")
-    best_low_main = best_bets["low"].get("main")
-    best_low_lottery = best_bets["low"].get("lottery")
-
-    for side, bucket_defs, probs, market_map, best_main, best_lottery in [
-        ("HIGH", DEFAULT_HIGH_TEMP_BUCKETS, high_probs, market_high, best_high_main, best_high_lottery),
-        ("LOW", DEFAULT_LOW_TEMP_BUCKETS, low_probs, market_low, best_low_main, best_low_lottery),
-    ]:
-        lines.append(side)
-        lines.append("")
-        for bucket_def in sorted(bucket_defs, key=_temp_sort_key):
-            bucket_label = bucket_def[0]
-            display_label = _contract_label(bucket_label)
-            model_prob = probs.get(bucket_label)
-            if model_prob is None:
-                # fallback for any bucket label format mismatch
-                for key, value in probs.items():
-                    if _contract_label(key) == display_label:
-                        model_prob = value
-                        break
-            model_prob = model_prob if model_prob is not None else 0.0
-            market_prob = _market_price_for_label(display_label, market_map)
-            market_prob = market_prob if market_prob is not None else 0.0
-
-            prefix = ""
-            suffix = ""
-            if best_main and _contract_label(best_main["bucket"]) == display_label:
-                prefix = "👉 "
-                suffix = "  (MAIN)"
-            elif best_lottery and _contract_label(best_lottery["bucket"]) == display_label:
-                prefix = "⭐ "
-                suffix = "  (LOTTERY)"
-
-            lines.append(
-                f"{prefix}{display_label}  Model {model_prob:.0%} | Market {market_prob:.0%}{suffix}"
-            )
-        lines.append("")
-
     return "\n".join(lines)
 
 def find_recommended_bets(predictions, market_prices, date_str):
