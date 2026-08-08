@@ -679,7 +679,15 @@ elif page == "Betting Analysis":
             ),
             "Action": bet.recommendation,
         })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    df_high = pd.DataFrame(rows)
+    if high_analysis.best_bet:
+        def highlight_best(s):
+            # s is a Series (row)
+            return ['background-color: #fff9c4' if s['Bucket'] == high_analysis.best_bet.bucket_label else '' for _ in s]
+        styled = df_high.style.apply(highlight_best, axis=1)
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+    else:
+        st.dataframe(df_high, use_container_width=True, hide_index=True)
 
     # Visualization
     chart_data = pd.DataFrame({
@@ -747,7 +755,14 @@ elif page == "Betting Analysis":
             ),
             "Action": bet.recommendation,
         })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    df_low = pd.DataFrame(rows)
+    if low_analysis.best_bet:
+        def highlight_best(s):
+            return ['background-color: #fff9c4' if s['Bucket'] == low_analysis.best_bet.bucket_label else '' for _ in s]
+        styled = df_low.style.apply(highlight_best, axis=1)
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+    else:
+        st.dataframe(df_low, use_container_width=True, hide_index=True)
 
     chart_data = pd.DataFrame({
         "Bucket": list(low_analysis.bucket_probs.keys()),
