@@ -215,6 +215,19 @@ def models_exist():
     )
 
 
+def pricing_status(edge) -> str:
+    """UNDERPRICED / OVERPRICED / FAIR VALUE from model vs market edge."""
+    try:
+        e = float(edge)
+    except (TypeError, ValueError):
+        return "⚪ FAIR VALUE"
+    if abs(e) < 0.01:
+        return "⚪ FAIR VALUE"
+    if e > 0:
+        return "🟢 UNDERPRICED"
+    return "🔴 OVERPRICED"
+
+
 def generate_synthetic_data():
     """Quick synthetic data for demo purposes"""
     dates = pd.date_range("2021-01-01", "2025-12-31")
@@ -549,6 +562,7 @@ elif page == "Betting Analysis":
             "Edge": f"{bet.edge:+.1%}",
             "EV": f"{bet.ev:+.1%}",
             "Kelly %": f"{bet.kelly_fraction:.1%}",
+            "Status": pricing_status(bet.edge),
             "Action": bet.recommendation,
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -611,6 +625,7 @@ elif page == "Betting Analysis":
             "Edge": f"{bet.edge:+.1%}",
             "EV": f"{bet.ev:+.1%}",
             "Kelly %": f"{bet.kelly_fraction:.1%}",
+            "Status": pricing_status(bet.edge),
             "Action": bet.recommendation,
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -641,18 +656,6 @@ elif page == "Betting Analysis":
     st.divider()
     st.markdown("### Quick Summary")
 
-    def _pricing_status(edge: float) -> str:
-        """Label market vs model probability."""
-        try:
-            e = float(edge)
-        except (TypeError, ValueError):
-            return "⚪ FAIR VALUE"
-        if abs(e) < 0.01:
-            return "⚪ FAIR VALUE"
-        if e > 0:
-            return "🟢 UNDERPRICED"
-        return "🔴 OVERPRICED"
-
     sc1, sc2 = st.columns(2)
 
     high_event_url = build_polymarket_event_url(date_iso, "highest")
@@ -661,7 +664,7 @@ elif page == "Betting Analysis":
     with sc1:
         if high_analysis.best_bet:
             bb = high_analysis.best_bet
-            status = _pricing_status(bb.edge)
+            status = pricing_status(bb.edge)
             st.metric(
                 "High Temp Best Bet",
                 bb.bucket_label,
@@ -681,7 +684,7 @@ elif page == "Betting Analysis":
     with sc2:
         if low_analysis.best_bet:
             bb = low_analysis.best_bet
-            status = _pricing_status(bb.edge)
+            status = pricing_status(bb.edge)
             st.metric(
                 "Low Temp Best Bet",
                 bb.bucket_label,
