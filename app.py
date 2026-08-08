@@ -1,7 +1,6 @@
 """
 HK Weather Prediction Dashboard - Streamlit GUI
 """
-# Revision note: dashboard behavior preserved; revision marker only.
 import sys
 from pathlib import Path
 
@@ -832,8 +831,32 @@ elif page == "Bankroll":
                 main_edge = f"{bets.get('main', {}).get('edge', 0):+.1%}" if bets.get("main") else "-"
                 lottery_bucket = bets.get("lottery", {}).get("bucket", "-") if bets.get("lottery") else "-"
                 
-                status = "Resolved" if e.get("resolved") else "Pending"
-                actual = f"{e.get('actual_temp', '?')}\u00b0C" if e.get("actual_temp") is not None else "-"
+                actual_temp = e.get("actual_temp")
+                provisional_temp = e.get("provisional_result")
+                provisional_price = e.get("provisional_market_price")
+
+                if e.get("resolved"):
+                    status = "🟢 Resolved"
+                elif provisional_temp is not None:
+                    status = "🟡 Provisional"
+                else:
+                    status = "⚪ Pending"
+
+                actual = f"{actual_temp}\u00b0C" if actual_temp is not None else "-"
+
+                if provisional_temp is not None:
+                    try:
+                        leader_price = (
+                            f" ({float(provisional_price):.0%})"
+                            if provisional_price is not None else ""
+                        )
+                    except (TypeError, ValueError):
+                        leader_price = ""
+                    market_leader = (
+                        f"{int(round(float(provisional_temp)))}\u00b0C{leader_price}"
+                    )
+                else:
+                    market_leader = "-"
 
                 log_rows.append({
                     "Date": e["target_date"],
@@ -842,11 +865,17 @@ elif page == "Bankroll":
                     "Model Prob": main_prob,
                     "Edge": main_edge,
                     "Lottery": lottery_bucket,
+                    "Market Leader": market_leader,
                     "Actual": actual,
                     "Status": status,
                 })
 
             st.dataframe(pd.DataFrame(log_rows), use_container_width=True, hide_index=True)
+            st.caption(
+                "🟡 Provisional = Polymarket bucket with the highest current YES price. "
+                "It is informational only and is not used for Bias Correction, Brier Score, "
+                "Win Rate, or ROI. HKO actual remains the final ground truth."
+            )
         else:
             st.info("No predictions logged yet.")
     else:

@@ -8,7 +8,6 @@ Improvements v2:
 - Model performance tracking
 - Ensemble NWP integration
 """
-# Revision note: alert/resolution behavior preserved; revision marker only.
 import sys
 import io
 import re

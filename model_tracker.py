@@ -2,7 +2,6 @@
 Model Performance Tracker — Tracks prediction accuracy over time.
 Logs predictions vs actual outcomes for model evaluation.
 """
-# Revision note: tracking behavior preserved; revision marker only.
 import json
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -90,7 +89,14 @@ def upsert_prediction(target_date, temp_type, bucket_probs, recommended_bets,
 
 
 def update_prediction(target_date, temp_type, actual_temp):
-    """Update a logged prediction with actual outcome."""
+    """Update a logged prediction with final HKO actual outcome."""
+    if actual_temp is None:
+        return
+    try:
+        actual_temp = int(round(float(actual_temp)))
+    except (TypeError, ValueError):
+        return
+
     if not PERFORMANCE_LOG.exists():
         return
     
