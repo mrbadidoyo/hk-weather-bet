@@ -392,17 +392,19 @@ if page == "Dashboard":
         st.stop()
 
     # Build forecast table
-    # Compute historical std for forecast errors (if available)
+    # Compute historical error quantiles for forecast errors (if available)
     try:
-        std_h, std_l = compute_historical_std(days=30)
+        (q10_max, q25_max, q50_max, q75_max, q90_max), (q10_min, q25_min, q50_min, q75_min, q90_min) = compute_historical_quantiles(days=30)
     except Exception:
-        std_h, std_l = 1.0, 0.8  # fallback to defaults
+        # Fallback to normal distribution quantiles with std=1.0 for max, 0.8 for min
+        from scipy.stats import norm
+        max_q = norm.ppf([0.10, 0.25, 0.50, 0.75, 0.90], loc=0, scale=1.0)
+        min_q = norm.ppf([0.10, 0.25, 0.50, 0.75, 0.90], loc=0, scale=0.8)
+        q10_max, q25_max, q50_max, q75_max, q90_max = max_q
+        q10_min, q25_min, q50_min, q75_min, q90_min = min_q
 
     high_buckets = parse_buckets(DEFAULT_HIGH_TEMP_BUCKETS)
     low_buckets = parse_buckets(DEFAULT_LOW_TEMP_BUCKETS)
-    # Convert to tuples for get_bucket_probs
-    high_buckets_tuples = [(b.label, b.lower, b.upper) for b in high_buckets]
-    low_buckets_tuples = [(b.label, b.lower, b.upper) for b in low_buckets]
 
     rows = []
     for day in wf:
@@ -418,9 +420,28 @@ if page == "Dashboard":
         min_t = float(day.get("forecastMintemp", {}).get("value", 0))
         weather = day.get("forecastWeather", "")[:40]
 
-        # Compute probabilities using utility function
-        high_probs = get_bucket_probs(max_t, std_h, high_buckets_tuples)
-        low_probs = get_bucket_probs(min_t, std_l, low_buckets_tuples)
+        # Calculate predictive quantiles by adding HKO forecast to historical error quantiles
+        max_q10 = max_t + q10_max
+        max_q25 = max_t + q25_max
+        max_q50 = max_t + q50_max
+        max_q75 = max_t + q75_max
+        max_q90 = max_t + q90_max
+
+        min_q10 = min_t + q10_min
+        min_q25 = min_t + q25_min
+        min_q50 = min_t + q50_min
+        min_q75 = min_t + q75_min
+        min_q90 = min_t + q90_min
+
+        # Compute probabilities using quantile-based approach
+        high_probs = bucket_probs_from_quantiles(
+            [(b.label, b.lower, b.upper) for b in high_buckets],
+            max_q10, max_q25, max_q50, max_q75, max_q90
+        )
+        low_probs = bucket_probs_from_quantiles(
+            [(b.label, b.lower, b.upper) for b in low_buckets],
+            min_q10, min_q25, min_q50, min_q75, min_q90
+        )
 
         # Find highest probability bucket
         best_high = max(high_probs, key=high_probs.get)
