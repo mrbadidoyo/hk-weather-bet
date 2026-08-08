@@ -680,6 +680,9 @@ elif page == "Betting Analysis":
             "Action": bet.recommendation,
         })
     df_high = pd.DataFrame(rows)
+    # Debug: show best bet and bucket labels
+    # st.write("High best bet:", high_analysis.best_bet.bucket_label if high_analysis.best_bet else None)
+    # st.write("High bucket labels:", list(df_high['Bucket']))
     if high_analysis.best_bet:
         def highlight_best(s):
             # s is a Series (row)
@@ -757,6 +760,9 @@ elif page == "Betting Analysis":
             "Action": bet.recommendation,
         })
     df_low = pd.DataFrame(rows)
+    # Debug: show best bet and bucket labels
+    # st.write("Low best bet:", low_analysis.best_bet.bucket_label if low_analysis.best_bet else None)
+    # st.write("Low bucket labels:", list(df_low['Bucket']))
     if low_analysis.best_bet:
         def highlight_best(s):
             return ['background-color: #fff9c4' if s['Bucket'] == low_analysis.best_bet.bucket_label else '' for _ in s]
