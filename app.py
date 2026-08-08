@@ -979,73 +979,133 @@ elif page == "Bankroll":
 # ====================================================================
 elif page == "Historical Data":
     st.markdown("# Historical Temperature Data")
-    st.caption("HKO Observatory HQ (1884-present) and VHHH Airport (Polymarket resolution)")
+    st.caption(
+        "Primary: **HKA / VHHH Airport** (Polymarket resolution source) · "
+        "Compare: HKO Headquarters"
+    )
+
+    def _temp_to_bucket_label(temp, bucket_defs):
+        for label, lo, hi in bucket_defs:
+            if lo <= -900:
+                if temp < hi:
+                    return label
+            elif hi >= 900:
+                if temp >= lo:
+                    return label
+            else:
+                if lo <= temp < hi:
+                    return label
+        return bucket_defs[-1][0]
 
     try:
         hko = HKODataCollector()
 
-        with st.spinner("Fetching HKO historical max temperatures..."):
-            max_df = hko.fetch_historical_csv("daily_max_temp")
-        with st.spinner("Fetching HKO historical min temperatures..."):
-            min_df = hko.fetch_historical_csv("daily_min_temp")
+        with st.spinner("Fetching HKA (Airport / Polymarket resolution)..."):
+            hka = hko.fetch_station_temps("HKA")
+        with st.spinner("Fetching HKO Headquarters (comparison)..."):
+            try:
+                hq = hko.fetch_station_temps("HKO")
+            except Exception:
+                hq = None
 
-        st.success(f"Loaded {len(max_df)} max temp records, {len(min_df)} min temp records")
+        st.success(
+            f"HKA loaded: {len(hka)} days "
+            f"({hka.index.min().date()} → {hka.index.max().date()})"
+            + (f" · HKO HQ: {len(hq)} days" if hq is not None else "")
+        )
 
-        # Show raw data
-        with st.expander("Raw Data Preview (Max Temp)"):
-            st.dataframe(max_df.head(20), use_container_width=True)
-        with st.expander("Raw Data Preview (Min Temp)"):
-            st.dataframe(min_df.head(20), use_container_width=True)
+        n_years = st.slider("Years to show", 3, 40, 10, key="hist_years")
+        cutoff = hka.index.max() - pd.DateOffset(years=n_years)
+        hka_f = hka[hka.index >= cutoff].copy()
+        hq_f = hq[hq.index >= cutoff].copy() if hq is not None else None
 
-        # Try to parse into time series
-        for label, df in [("Max Temperature", max_df), ("Min Temperature", min_df)]:
-            cols = df.columns.tolist()
-            if "Year" in cols and "Month" in cols and "Day" in cols:
-                df["date"] = pd.to_datetime(df[["Year", "Month", "Day"]])
-                val_cols = [c for c in cols if c not in ["Year", "Month", "Day"]]
-                if val_cols:
-                    df["value"] = pd.to_numeric(df[val_cols[0]], errors="coerce")
-                    df = df.dropna(subset=["date", "value"])
-                    df = df.sort_values("date")
+        # ── Metrics ───────────────────────────────────────────────
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("HKA Mean Max", f"{hka_f['max_temp'].mean():.1f}°C")
+        m2.metric("HKA Mean Min", f"{hka_f['min_temp'].mean():.1f}°C")
+        if hq_f is not None and len(hq_f):
+            aligned = hka_f[["max_temp"]].join(
+                hq_f[["max_temp"]].rename(columns={"max_temp": "hq_max"}),
+                how="inner",
+            )
+            if len(aligned):
+                offset = (aligned["hq_max"] - aligned["max_temp"]).mean()
+                m3.metric("HQ − HKA (Max)", f"{offset:+.2f}°C")
+            else:
+                m3.metric("HQ − HKA (Max)", "n/a")
+        else:
+            m3.metric("HQ − HKA (Max)", "n/a")
+        m4.metric("Days", f"{len(hka_f):,}")
 
-                    # Filter last N years
-                    n_years = st.slider(f"Years to show ({label})", 5, 140, 20, key=f"years_{label}")
-                    cutoff = df["date"].max() - pd.DateOffset(years=n_years)
-                    filtered = df[df["date"] >= cutoff]
+        # ── Chart: HKA primary, HQ secondary ──────────────────────
+        st.markdown("### Daily temperatures (resolution source)")
+        chart = pd.DataFrame({
+            "HKA Max (resolution)": hka_f["max_temp"],
+            "HKA Min (resolution)": hka_f["min_temp"],
+        })
+        if hq_f is not None and len(hq_f):
+            chart["HKO HQ Max"] = hq_f["max_temp"]
+            chart["HKO HQ Min"] = hq_f["min_temp"]
+        st.line_chart(chart)
 
-                    st.markdown(f"### {label} (last {n_years} years)")
-                    chart_df = filtered.set_index("date")[["value"]].rename(columns={"value": f"{label} (°C)"})
-                    st.line_chart(chart_df)
+        # ── Monthly averages ──────────────────────────────────────
+        st.markdown("### Monthly average — HKA Max")
+        tmp = hka_f.copy()
+        tmp["month"] = tmp.index.month
+        monthly_avg = tmp.groupby("month")["max_temp"].mean()
+        month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        monthly_chart = pd.DataFrame({
+            "Month": [month_names[i - 1] for i in monthly_avg.index],
+            "HKA Max (°C)": monthly_avg.values,
+        }).set_index("Month")
+        st.bar_chart(monthly_chart)
 
-                    # Statistics
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Mean", f"{filtered['value'].mean():.1f}°C")
-                    c2.metric("Std Dev", f"{filtered['value'].std():.1f}°C")
-                    c3.metric("Min", f"{filtered['value'].min():.1f}°C")
-                    c4.metric("Max", f"{filtered['value'].max():.1f}°C")
+        # ── Bucket frequency (links to Polymarket structure) ──────
+        st.markdown("### Bucket frequency — HKA daily max (Polymarket-style)")
+        st.caption("How often each high-temp bucket would have won, based on HKA actuals.")
 
-                    # Monthly averages
-                    st.markdown(f"### Monthly Averages ({label})")
-                    monthly = filtered.copy()
-                    monthly["month"] = monthly["date"].dt.month
-                    monthly_avg = monthly.groupby("month")["value"].mean()
-                    month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-                    monthly_chart = pd.DataFrame({
-                        "Month": month_names,
-                        "Avg Temp (°C)": monthly_avg.values,
-                    }).set_index("Month")
-                    st.bar_chart(monthly_chart)
+        season = st.selectbox(
+            "Season filter",
+            ["All months", "Summer (May–Oct)", "Winter (Nov–Apr)"],
+            key="hist_season",
+        )
+        freq_df = hka_f.copy()
+        if season == "Summer (May–Oct)":
+            freq_df = freq_df[freq_df.index.month.isin([5, 6, 7, 8, 9, 10])]
+        elif season == "Winter (Nov–Apr)":
+            freq_df = freq_df[freq_df.index.month.isin([11, 12, 1, 2, 3, 4])]
+
+        if len(freq_df):
+            labels = [
+                _temp_to_bucket_label(t, DEFAULT_HIGH_TEMP_BUCKETS)
+                for t in freq_df["max_temp"]
+            ]
+            counts = pd.Series(labels).value_counts()
+            # Preserve bucket order from config
+            order = [b[0] for b in DEFAULT_HIGH_TEMP_BUCKETS]
+            counts = counts.reindex(order).fillna(0).astype(int)
+            pct = (counts / counts.sum() * 100).round(1)
+
+            freq_table = pd.DataFrame({
+                "Bucket": counts.index,
+                "Days": counts.values,
+                "Frequency %": pct.values,
+            })
+            st.dataframe(freq_table, use_container_width=True, hide_index=True)
+            st.bar_chart(freq_table.set_index("Bucket")["Frequency %"])
+        else:
+            st.info("No days in selected filter.")
+
+        with st.expander("Raw HKA sample"):
+            st.dataframe(hka_f.tail(30), use_container_width=True)
 
     except Exception as e:
-        st.warning(f"Could not fetch historical data: {e}")
-        st.info("Showing synthetic demo data instead...")
-
-        demo = generate_synthetic_data()
-        st.line_chart(demo[["hko_max_temp", "hko_min_temp"]].rename(columns={
-            "hko_max_temp": "HKO Max (°C)",
-            "hko_min_temp": "HKO Min (°C)",
-        }).tail(730))
+        st.error(f"Could not fetch historical data: {e}")
+        st.info(
+            "Check network access to data.weather.gov.hk. "
+            "Synthetic demo is disabled on this page — fix the source instead."
+        )
 
 
 # ====================================================================

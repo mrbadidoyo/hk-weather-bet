@@ -49,16 +49,81 @@ class HKODataCollector:
         """Fetch local weather forecast (today/tomorrow)"""
         return self.fetch_hko_api("flw")
 
+    def _parse_hko_climatology_csv(self, text: str) -> pd.DataFrame:
+        """
+        Parse HKO CLM* CSV which often has preamble rows before the header.
+        Returns DataFrame with columns: date, value
+        """
+        lines = text.strip().split("\n")
+        header_idx = 0
+        for i, line in enumerate(lines):
+            if "Year" in line or "year" in line:
+                header_idx = i
+                break
+
+        clean = []
+        for line in lines[header_idx:]:
+            s = line.strip().strip('"')
+            if not s:
+                continue
+            if s.startswith("***") or s.startswith("#") or s.startswith("C "):
+                continue
+            clean.append(line)
+
+        df = pd.read_csv(io.StringIO("\n".join(clean)))
+        cols = df.columns.tolist()
+        yc = next(c for c in cols if "year" in c.lower())
+        mc = next(c for c in cols if "month" in c.lower())
+        dc = next(c for c in cols if "day" in c.lower())
+        vc = next(c for c in cols if "value" in c.lower() or "temp" in c.lower()
+                  or c not in (yc, mc, dc))
+
+        out = pd.DataFrame({
+            "date": pd.to_datetime(
+                df[[yc, mc, dc]].rename(columns={yc: "Year", mc: "Month", dc: "Day"}),
+                errors="coerce",
+            ),
+            "value": pd.to_numeric(df[vc], errors="coerce"),
+        })
+        return out.dropna(subset=["date", "value"]).sort_values("date").reset_index(drop=True)
+
     def fetch_historical_csv(self, dataset_key: str) -> pd.DataFrame:
-        """Fetch a historical dataset CSV from DATA.GOV.HK"""
+        """Fetch a historical dataset CSV from DATA.GOV.HK (robust to preamble rows)."""
         if dataset_key not in DATAGOVHK_DATASETS:
             raise ValueError(f"Unknown dataset: {dataset_key}. Available: {list(DATAGOVHK_DATASETS.keys())}")
         url = DATAGOVHK_DATASETS[dataset_key]["url"]
         logger.info(f"Fetching {dataset_key} from {url}")
         resp = self.session.get(url, timeout=60)
         resp.raise_for_status()
-        df = pd.read_csv(io.StringIO(resp.text))
-        return df
+        text = resp.content.decode("utf-8-sig")
+        try:
+            return self._parse_hko_climatology_csv(text)
+        except Exception:
+            # Fallback: raw read (may still fail on preamble)
+            return pd.read_csv(io.StringIO(resp.text))
+
+    def fetch_station_temps(self, station: str = "HKA") -> pd.DataFrame:
+        """
+        Fetch daily max/min for a station (HKA or HKO).
+        Returns DataFrame indexed by date with columns max_temp, min_temp.
+        """
+        base = "https://data.weather.gov.hk/weatherAPI/opendata/opendata.php"
+        urls = {
+            "max": f"{base}?dataType=CLMMAXT&rformat=csv&station={station}",
+            "min": f"{base}?dataType=CLMMINT&rformat=csv&station={station}",
+        }
+
+        def one(url):
+            resp = self.session.get(url, timeout=60)
+            resp.raise_for_status()
+            text = resp.content.decode("utf-8-sig")
+            df = self._parse_hko_climatology_csv(text)
+            return df.set_index("date")["value"]
+
+        mx = one(urls["max"])
+        mn = one(urls["min"])
+        out = pd.DataFrame({"max_temp": mx, "min_temp": mn}).dropna()
+        return out
 
     def fetch_all_historical(self) -> dict[str, pd.DataFrame]:
         """Fetch all available historical datasets"""
