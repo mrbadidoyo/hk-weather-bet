@@ -81,6 +81,100 @@ def save_market_prices(prices: dict):
         json.dump(prices, f, indent=2)
 
 
+def _normalize_bucket_key(label: str) -> str:
+    """Normalize bucket label for fuzzy matching across sources."""
+    import re
+    s = (label or "").lower().replace("°", "").replace("c", "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def map_live_prices_to_defaults(live_prices: dict, default_buckets: list) -> dict:
+    """
+    Map Polymarket live prices onto DEFAULT_* bucket labels.
+    Tries exact match, then normalized / numeric match.
+    """
+    import re
+    mapped = {}
+    live_by_norm = {_normalize_bucket_key(k): float(v) for k, v in live_prices.items()}
+
+    for label, lo, hi in default_buckets:
+        # 1) exact
+        if label in live_prices:
+            mapped[label] = float(live_prices[label])
+            continue
+        # 2) normalized
+        norm = _normalize_bucket_key(label)
+        if norm in live_by_norm:
+            mapped[label] = live_by_norm[norm]
+            continue
+        # 3) numeric core match (e.g. "34" inside both labels)
+        m = re.search(r"(\d+)", label)
+        if m:
+            num = m.group(1)
+            for lk, lv in live_prices.items():
+                if re.search(rf"\b{num}\b", str(lk)):
+                    # Prefer same open-ended type
+                    lab_low = "below" in label.lower()
+                    lab_high = "higher" in label.lower()
+                    live_low = "below" in str(lk).lower()
+                    live_high = "higher" in str(lk).lower()
+                    if lab_low == live_low and lab_high == live_high:
+                        mapped[label] = float(lv)
+                        break
+            else:
+                # last resort: any label containing the number
+                for lk, lv in live_prices.items():
+                    if num in str(lk):
+                        mapped[label] = float(lv)
+                        break
+
+    return mapped
+
+
+def fetch_live_polymarket_prices(date_iso: str, days_ahead: int = 10) -> dict:
+    """
+    Fetch live Polymarket prices for a given date.
+
+    Returns:
+        {
+          "high": {bucket_label: price, ...},
+          "low":  {bucket_label: price, ...},
+          "raw_high": {...},  # original labels from API
+          "raw_low": {...},
+          "events_found": int,
+        }
+    """
+    from polymarket_scraper import PolymarketScraper
+
+    scraper = PolymarketScraper()
+    events = scraper.find_events_by_slug(days_ahead=days_ahead)
+
+    result = {
+        "high": {},
+        "low": {},
+        "raw_high": {},
+        "raw_low": {},
+        "events_found": len(events),
+    }
+
+    for event in events:
+        if event.get("_date") != date_iso:
+            continue
+        snap = scraper.get_market_snapshot(event)
+        prices = snap.get("prices") or {}
+        etype = (snap.get("type") or event.get("_type") or "").lower()
+
+        if etype == "highest":
+            result["raw_high"] = prices
+            result["high"] = map_live_prices_to_defaults(prices, DEFAULT_HIGH_TEMP_BUCKETS)
+        elif etype == "lowest":
+            result["raw_low"] = prices
+            result["low"] = map_live_prices_to_defaults(prices, DEFAULT_LOW_TEMP_BUCKETS)
+
+    return result
+
+
 def models_exist():
     return (
         (MODELS_DIR / "temp_predictor_max_temp.joblib").exists()
@@ -304,7 +398,7 @@ if page == "Dashboard":
 # ====================================================================
 elif page == "Betting Analysis":
     st.markdown("# Polymarket Betting Analysis")
-    st.caption("Enter market prices to identify +EV betting opportunities")
+    st.caption("Fetch live Polymarket prices or enter them manually to identify +EV bets")
 
     # ── Fetch forecast ──────────────────────────────────────────────
     try:
@@ -342,6 +436,47 @@ elif page == "Betting Analysis":
 
     # Load saved market prices
     saved_prices = load_market_prices()
+    high_key = f"{date_iso}_high"
+    low_key = f"{date_iso}_low"
+
+    # ── Live Polymarket fetch ────────────────────────────────────────
+    st.divider()
+    col_fetch, col_info = st.columns([1, 3])
+    with col_fetch:
+        fetch_clicked = st.button("🔄 Fetch live prices", use_container_width=True)
+    with col_info:
+        st.caption("Ambil harga YES share langsung dari Polymarket untuk tanggal yang dipilih.")
+
+    if fetch_clicked:
+        with st.spinner(f"Fetching Polymarket prices for {date_iso}..."):
+            try:
+                live = fetch_live_polymarket_prices(date_iso)
+                n_high = len(live.get("high") or {})
+                n_low = len(live.get("low") or {})
+                if n_high == 0 and n_low == 0:
+                    st.warning(
+                        f"Tidak ada market aktif untuk {date_iso} "
+                        f"(events scanned: {live.get('events_found', 0)}). "
+                        "Coba tanggal lain atau isi manual."
+                    )
+                else:
+                    if n_high:
+                        saved_prices[high_key] = {
+                            **saved_prices.get(high_key, {}),
+                            **live["high"],
+                        }
+                    if n_low:
+                        saved_prices[low_key] = {
+                            **saved_prices.get(low_key, {}),
+                            **live["low"],
+                        }
+                    save_market_prices(saved_prices)
+                    st.success(
+                        f"Live prices loaded — High: {n_high} buckets, Low: {n_low} buckets"
+                    )
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Gagal fetch Polymarket: {e}")
 
     # ── High Temp Market ────────────────────────────────────────────
     st.divider()
@@ -351,14 +486,14 @@ elif page == "Betting Analysis":
     high_buckets = parse_buckets(DEFAULT_HIGH_TEMP_BUCKETS)
     high_probs = compute_bucket_probabilities(max_t, 1.0, high_buckets)
 
-    high_key = f"{date_iso}_high"
     saved_high = saved_prices.get(high_key, {})
 
     st.markdown("**Market Prices (YES share price, 0.00 - 1.00):**")
     hcols = st.columns(len(DEFAULT_HIGH_TEMP_BUCKETS))
     high_market_prices = {}
     for i, (label, _, _) in enumerate(DEFAULT_HIGH_TEMP_BUCKETS):
-        default_val = saved_high.get(label, 0.14)
+        default_val = float(saved_high.get(label, 0.14))
+        default_val = min(0.99, max(0.01, default_val))
         high_market_prices[label] = hcols[i].number_input(
             label, min_value=0.01, max_value=0.99, value=default_val, step=0.01, key=f"hp_{sel_idx}_{i}"
         )
@@ -414,14 +549,14 @@ elif page == "Betting Analysis":
     low_buckets = parse_buckets(DEFAULT_LOW_TEMP_BUCKETS)
     low_probs = compute_bucket_probabilities(min_t, 0.8, low_buckets)
 
-    low_key = f"{date_iso}_low"
     saved_low = saved_prices.get(low_key, {})
 
     st.markdown("**Market Prices (YES share price, 0.00 - 1.00):**")
     lcols = st.columns(len(DEFAULT_LOW_TEMP_BUCKETS))
     low_market_prices = {}
     for i, (label, _, _) in enumerate(DEFAULT_LOW_TEMP_BUCKETS):
-        default_val = saved_low.get(label, 0.14)
+        default_val = float(saved_low.get(label, 0.14))
+        default_val = min(0.99, max(0.01, default_val))
         low_market_prices[label] = lcols[i].number_input(
             label, min_value=0.01, max_value=0.99, value=default_val, step=0.01, key=f"lp_{sel_idx}_{i}"
         )
