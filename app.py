@@ -30,6 +30,7 @@ from polymarket_strategy import (
     compute_bucket_probabilities,
     parse_buckets,
 )
+from utils import get_bucket_probs, compute_historical_std
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -57,13 +58,15 @@ st.markdown("""
 @st.cache_data(ttl=600, show_spinner="Fetching HKO forecast...")
 def fetch_hko_forecast():
     hko = HKODataCollector()
-    return hko.fetch_9day_forecast()
+    data = hko.fetch_9day_forecast()
+    return {"data": data, "fetched_at": datetime.now()}
 
 
 @st.cache_data(ttl=600, show_spinner="Fetching current weather...")
 def fetch_current_weather():
     hko = HKODataCollector()
-    return hko.fetch_current_weather()
+    data = hko.fetch_current_weather()
+    return {"data": data, "fetched_at": datetime.now()}
 
 
 def load_market_prices():
@@ -346,8 +349,12 @@ if page == "Dashboard":
 
     # Fetch live data
     try:
-        forecast = fetch_hko_forecast()
-        current = fetch_current_weather()
+        forecast_result = fetch_hko_forecast()
+        current_result = fetch_current_weather()
+        forecast = forecast_result["data"]
+        forecast_time = forecast_result["fetched_at"]
+        current = current_result["data"]
+        current_time = current_result["fetched_at"]
     except Exception as e:
         st.error(f"Cannot reach HKO API: {e}")
         st.stop()
@@ -373,6 +380,7 @@ if page == "Dashboard":
     c2.metric("Humidity", f"{rh_val}%")
     c3.metric("Conditions", weather_text)
 
+    st.caption(f"Data last fetched: HKO forecast {forecast_time.strftime('%H:%M:%S')}, current weather {current_time.strftime('%H:%M:%S')}")
     st.divider()
 
     # ── 9-Day Forecast with probabilities ───────────────────────────
@@ -384,6 +392,18 @@ if page == "Dashboard":
         st.stop()
 
     # Build forecast table
+    # Compute historical std for forecast errors (if available)
+    try:
+        std_h, std_l = compute_historical_std(days=30)
+    except Exception:
+        std_h, std_l = 1.0, 0.8  # fallback to defaults
+
+    high_buckets = parse_buckets(DEFAULT_HIGH_TEMP_BUCKETS)
+    low_buckets = parse_buckets(DEFAULT_LOW_TEMP_BUCKETS)
+    # Convert to tuples for get_bucket_probs
+    high_buckets_tuples = [(b.label, b.lower, b.upper) for b in high_buckets]
+    low_buckets_tuples = [(b.label, b.lower, b.upper) for b in low_buckets]
+
     rows = []
     for day in wf:
         date_str = day.get("forecastDate", "")
@@ -398,12 +418,9 @@ if page == "Dashboard":
         min_t = float(day.get("forecastMintemp", {}).get("value", 0))
         weather = day.get("forecastWeather", "")[:40]
 
-        # Compute probabilities
-        std_h, std_l = 1.0, 0.8
-        high_buckets = parse_buckets(DEFAULT_HIGH_TEMP_BUCKETS)
-        low_buckets = parse_buckets(DEFAULT_LOW_TEMP_BUCKETS)
-        high_probs = compute_bucket_probabilities(max_t, std_h, high_buckets)
-        low_probs = compute_bucket_probabilities(min_t, std_l, low_buckets)
+        # Compute probabilities using utility function
+        high_probs = get_bucket_probs(max_t, std_h, high_buckets_tuples)
+        low_probs = get_bucket_probs(min_t, std_l, low_buckets_tuples)
 
         # Find highest probability bucket
         best_high = max(high_probs, key=high_probs.get)
@@ -418,7 +435,15 @@ if page == "Dashboard":
             "Weather": weather,
         })
 
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    forecast_df = pd.DataFrame(rows)
+    st.dataframe(forecast_df, use_container_width=True, hide_index=True)
+    csv = forecast_df.to_csv(index=False)
+    st.download_button(
+        label="Download forecast as CSV",
+        data=csv,
+        file_name=f"hk_weather_forecast_{datetime.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+    )
 
     # ── NWP Ensemble Forecast ──────────────────────────────────────
     st.divider()
@@ -429,9 +454,12 @@ if page == "Dashboard":
         @st.cache_data(ttl=3600)
         def fetch_nwp_ensemble():
             nwp = NWPCollector()
-            return nwp.fetch_ensemble_forecast(forecast_days=7)
+            data = nwp.fetch_ensemble_forecast(forecast_days=7)
+            return {"data": data, "fetched_at": datetime.now()}
 
-        ens_data = fetch_nwp_ensemble()
+        ens_result = fetch_nwp_ensemble()
+        ens_data = ens_result["data"]
+        ens_time = ens_result["fetched_at"]
         nwp = NWPCollector()
 
         nwp_rows = []
@@ -455,8 +483,17 @@ if page == "Dashboard":
                     'Best Low': f"{best_l} ({min_probs[best_l]:.0%})",
                 })
 
-        st.dataframe(pd.DataFrame(nwp_rows), use_container_width=True, hide_index=True)
+        nwp_df = pd.DataFrame(nwp_rows)
+        st.dataframe(nwp_df, use_container_width=True, hide_index=True)
+        csv = nwp_df.to_csv(index=False)
+        st.download_button(
+            label="Download NWP forecast as CSV",
+            data=csv,
+            file_name=f"hk_nwp_forecast_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+        )
         st.caption(f"{ens_data.get('n_ecmwf', 50)} ECMWF + {ens_data.get('n_gfs', 30)} GFS = {ens_data.get('n_total', 80)} ensemble members")
+        st.caption(f"NWP data last fetched: {ens_time.strftime('%H:%M:%S')}")
 
         # NWP bucket probability chart for selected day
         if len(ens_data['dates']) > 0:
@@ -487,8 +524,10 @@ if page == "Dashboard":
 
     high_buckets = parse_buckets(DEFAULT_HIGH_TEMP_BUCKETS)
     low_buckets = parse_buckets(DEFAULT_LOW_TEMP_BUCKETS)
-    high_probs = compute_bucket_probabilities(max_t, 1.0, high_buckets)
-    low_probs = compute_bucket_probabilities(min_t, 0.8, low_buckets)
+    high_buckets_tuples = [(b.label, b.lower, b.upper) for b in high_buckets]
+    low_buckets_tuples = [(b.label, b.lower, b.upper) for b in low_buckets]
+    high_probs = get_bucket_probs(max_t, std_h, high_buckets_tuples)
+    low_probs = get_bucket_probs(min_t, std_l, low_buckets_tuples)
 
     col_a, col_b = st.columns(2)
 
