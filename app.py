@@ -228,6 +228,76 @@ def pricing_status(edge) -> str:
     return "🔴 OVERPRICED"
 
 
+def bet_risk(market_price, model_prob, edge, kelly_fraction=0.0, forecast_temp=None, bucket_label=None) -> str:
+    """
+    Risk label for a bucket bet.
+
+    Heuristics:
+    - HIGH: very cheap lottery-like price, thin edge, or far from forecast
+    - MEDIUM: moderate price / size / distance
+    - LOW: reasonable price, solid edge, near forecast
+    """
+    import re
+
+    try:
+        px = float(market_price)
+    except (TypeError, ValueError):
+        px = 0.5
+    try:
+        mp = float(model_prob)
+    except (TypeError, ValueError):
+        mp = 0.0
+    try:
+        e = float(edge)
+    except (TypeError, ValueError):
+        e = 0.0
+    try:
+        kelly = float(kelly_fraction)
+    except (TypeError, ValueError):
+        kelly = 0.0
+
+    distance = None
+    if forecast_temp is not None and bucket_label is not None:
+        m = re.search(r"(\d+)", str(bucket_label))
+        if m:
+            try:
+                distance = abs(int(m.group(1)) - float(forecast_temp))
+            except (TypeError, ValueError):
+                distance = None
+
+    score = 0  # higher = riskier
+
+    if px <= 0.08:
+        score += 2
+    elif px <= 0.15:
+        score += 1
+
+    if abs(e) < 0.03:
+        score += 1
+    elif e >= 0.10 and px >= 0.15:
+        score -= 1
+
+    if mp < 0.10:
+        score += 2
+    elif mp < 0.20:
+        score += 1
+
+    if kelly >= 0.15:
+        score += 1
+
+    if distance is not None:
+        if distance >= 3:
+            score += 2
+        elif distance >= 2:
+            score += 1
+
+    if score >= 3:
+        return "🔴 HIGH"
+    if score >= 1:
+        return "🟡 MEDIUM"
+    return "🟢 LOW"
+
+
 def generate_synthetic_data():
     """Quick synthetic data for demo purposes"""
     dates = pd.date_range("2021-01-01", "2025-12-31")
@@ -563,6 +633,11 @@ elif page == "Betting Analysis":
             "EV": f"{bet.ev:+.1%}",
             "Kelly %": f"{bet.kelly_fraction:.1%}",
             "Status": pricing_status(bet.edge),
+            "Risk": bet_risk(
+                bet.market_price, bet.model_prob, bet.edge,
+                bet.kelly_fraction, forecast_temp=max_t,
+                bucket_label=bet.bucket_label,
+            ),
             "Action": bet.recommendation,
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -626,6 +701,11 @@ elif page == "Betting Analysis":
             "EV": f"{bet.ev:+.1%}",
             "Kelly %": f"{bet.kelly_fraction:.1%}",
             "Status": pricing_status(bet.edge),
+            "Risk": bet_risk(
+                bet.market_price, bet.model_prob, bet.edge,
+                bet.kelly_fraction, forecast_temp=min_t,
+                bucket_label=bet.bucket_label,
+            ),
             "Action": bet.recommendation,
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
