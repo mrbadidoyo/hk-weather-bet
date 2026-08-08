@@ -830,51 +830,51 @@ elif page == "Bankroll":
                 main_prob = f"{bets.get('main', {}).get('model', 0):.0%}" if bets.get("main") else "-"
                 main_edge = f"{bets.get('main', {}).get('edge', 0):+.1%}" if bets.get("main") else "-"
                 lottery_bucket = bets.get("lottery", {}).get("bucket", "-") if bets.get("lottery") else "-"
-                
-                actual_temp = e.get("actual_temp")
-                provisional_temp = e.get("provisional_result")
-                provisional_price = e.get("provisional_market_price")
 
-                if e.get("resolved"):
-                    status = "🟢 Resolved"
-                elif provisional_temp is not None:
-                    status = "🟡 Provisional"
-                else:
-                    status = "⚪ Pending"
+                # Model leader: stored field, else from bucket_probs
+                model_leader = e.get("model_leader")
+                if not model_leader:
+                    probs = e.get("bucket_probs") or {}
+                    if probs:
+                        model_leader = max(probs, key=probs.get)
+                model_leader = model_leader or "-"
 
-                actual = f"{actual_temp}\u00b0C" if actual_temp is not None else "-"
-
-                if provisional_temp is not None:
+                # Market leader: stored field, else from market_prices map
+                market_leader = e.get("market_leader")
+                market_leader_price = e.get("market_leader_price")
+                if not market_leader:
+                    mkt = e.get("market_prices") or {}
+                    if mkt:
+                        market_leader = max(mkt, key=mkt.get)
+                        market_leader_price = mkt.get(market_leader)
+                if market_leader and market_leader_price is not None:
                     try:
-                        leader_price = (
-                            f" ({float(provisional_price):.0%})"
-                            if provisional_price is not None else ""
-                        )
+                        market_leader_disp = f"{market_leader} ({float(market_leader_price):.0%})"
                     except (TypeError, ValueError):
-                        leader_price = ""
-                    market_leader = (
-                        f"{int(round(float(provisional_temp)))}\u00b0C{leader_price}"
-                    )
+                        market_leader_disp = str(market_leader)
                 else:
-                    market_leader = "-"
+                    market_leader_disp = market_leader or "-"
+
+                status = "Resolved" if e.get("resolved") else "Pending"
+                actual = f"{e.get('actual_temp', '?')}\u00b0C" if e.get("actual_temp") is not None else "-"
 
                 log_rows.append({
                     "Date": e["target_date"],
                     "Type": e["temp_type"].upper(),
+                    "Model Leader": model_leader,
+                    "Market Leader": market_leader_disp,
                     "Main Bet": main_bucket,
                     "Model Prob": main_prob,
                     "Edge": main_edge,
                     "Lottery": lottery_bucket,
-                    "Market Leader": market_leader,
                     "Actual": actual,
                     "Status": status,
                 })
 
             st.dataframe(pd.DataFrame(log_rows), use_container_width=True, hide_index=True)
             st.caption(
-                "🟡 Provisional = Polymarket bucket with the highest current YES price. "
-                "It is informational only and is not used for Bias Correction, Brier Score, "
-                "Win Rate, or ROI. HKO actual remains the final ground truth."
+                "Market Leader = bucket with highest Polymarket YES price at log time. "
+                "Old rows may show '-' until the next telegram_alert /predict run."
             )
         else:
             st.info("No predictions logged yet.")
@@ -892,64 +892,28 @@ elif page == "Bankroll":
     bc1, bc2 = st.columns(2)
     for col, temp_type in [(bc1, "high"), (bc2, "low")]:
         with col:
-            # get_bias_report() returns {global: ..., by_range: ...}
-            report = bias_report.get(temp_type, {})
-            b = report.get("global", {})
+            b = bias_report[temp_type]
             label = "HIGH Temperature" if temp_type == "high" else "LOW Temperature"
             st.markdown(f"### {label}")
 
-            n_samples = b.get("n_samples", 0)
-            if n_samples == 0:
+            if b["n_samples"] == 0:
                 st.info("No bias data yet. Will start learning after first resolved event.")
             else:
-                mean_error = float(b.get("mean_error", 0.0))
-                correction = float(b.get("correction", 0.0))
-                direction = b.get("direction", "calibrated")
-                confidence = b.get("confidence", "LOW")
-                direction_emoji = "⬆️" if mean_error > 0 else "⬇️" if mean_error < 0 else "✅"
-
+                direction_emoji = "\u2b06\ufe0f" if b["mean_error"] > 0 else "\u2b07\ufe0f" if b["mean_error"] < 0 else "\u2705"
                 c_b1, c_b2, c_b3 = st.columns(3)
-                c_b1.metric("Direction", f"{direction_emoji} {direction}")
-                c_b2.metric("Mean Error", f"{mean_error:+.2f}°C")
-                c_b3.metric("Correction", f"{correction:+.2f}°C")
+                c_b1.metric("Direction", f"{direction_emoji} {b['direction']}")
+                c_b2.metric("Mean Error", f"{b['mean_error']:+.2f}\u00b0C")
+                c_b3.metric("Correction", f"{b['correction']:+.2f}\u00b0C")
 
-                # get_bias_report() does not expose ewma_error directly.
-                # Its correction value is the EWMA-based correction used by
-                # the bias corrector.
-                st.caption(
-                    f"Samples: {n_samples} | Correction: {correction:+.2f}°C | "
-                    f"Confidence: {confidence}"
-                )
+                st.caption(f"Samples: {b['n_samples']} | EWMA: {b['ewma_error']:+.2f}\u00b0C | Confidence: {b['confidence']}")
 
-                if abs(correction) > 1.0:
+                # Visual indicator
+                if abs(b["correction"]) > 1.0:
                     st.warning("Large bias detected — model may need recalibration")
-                elif abs(correction) > 0.5:
+                elif abs(b["correction"]) > 0.5:
                     st.info("Moderate bias — correction being applied")
                 else:
                     st.success("Model well-calibrated")
-
-            # Range-aware learning details. get_bias_report() only returns
-            # ranges that have enough samples for range-specific learning.
-            range_stats = report.get("by_range", {})
-            if range_stats:
-                st.markdown("**Range Analysis**")
-                range_rows = []
-                for range_label, stats in range_stats.items():
-                    range_rows.append({
-                        "Temperature Range": range_label,
-                        "Direction": stats.get("direction", "calibrated"),
-                        "Mean Error": f"{float(stats.get('mean_error', 0.0)):+.2f}°C",
-                        "Correction": f"{float(stats.get('correction', 0.0)):+.2f}°C",
-                        "Samples": stats.get("n_samples", 0),
-                        "Confidence": stats.get("confidence", "LOW"),
-                    })
-                st.dataframe(
-                    pd.DataFrame(range_rows),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-            else:
-                st.caption("No temperature range has enough samples yet for range-specific learning.")
 
     st.divider()
 
@@ -1063,14 +1027,68 @@ elif page == "Historical Data":
                     return label
         return bucket_defs[-1][0]
 
+    def _fetch_station_temps_fallback(collector, station: str) -> pd.DataFrame:
+        """Fallback if local data_collector is older (no fetch_station_temps)."""
+        import io
+        base = "https://data.weather.gov.hk/weatherAPI/opendata/opendata.php"
+        urls = {
+            "max": f"{base}?dataType=CLMMAXT&rformat=csv&station={station}",
+            "min": f"{base}?dataType=CLMMINT&rformat=csv&station={station}",
+        }
+
+        def parse_one(url):
+            resp = collector.session.get(url, timeout=60)
+            resp.raise_for_status()
+            text = resp.content.decode("utf-8-sig")
+            lines = text.strip().split("\n")
+            header_idx = 0
+            for i, line in enumerate(lines):
+                if "Year" in line or "year" in line:
+                    header_idx = i
+                    break
+            clean = []
+            for line in lines[header_idx:]:
+                s = line.strip().strip('"')
+                if not s or s.startswith("***") or s.startswith("#") or s.startswith("C "):
+                    continue
+                clean.append(line)
+            df = pd.read_csv(io.StringIO("\n".join(clean)))
+            cols = df.columns.tolist()
+            yc = next(c for c in cols if "year" in c.lower())
+            mc = next(c for c in cols if "month" in c.lower())
+            dc = next(c for c in cols if "day" in c.lower())
+            vc = next(
+                c for c in cols
+                if "value" in c.lower() or (
+                    c not in (yc, mc, dc) and "year" not in c.lower()
+                )
+            )
+            out = pd.DataFrame({
+                "date": pd.to_datetime(
+                    df[[yc, mc, dc]].rename(columns={yc: "Year", mc: "Month", dc: "Day"}),
+                    errors="coerce",
+                ),
+                "value": pd.to_numeric(df[vc], errors="coerce"),
+            }).dropna()
+            return out.set_index("date")["value"]
+
+        mx = parse_one(urls["max"])
+        mn = parse_one(urls["min"])
+        return pd.DataFrame({"max_temp": mx, "min_temp": mn}).dropna()
+
     try:
         hko = HKODataCollector()
 
+        def _load_station(station: str) -> pd.DataFrame:
+            if hasattr(hko, "fetch_station_temps"):
+                return hko.fetch_station_temps(station)
+            return _fetch_station_temps_fallback(hko, station)
+
         with st.spinner("Fetching HKA (Airport / Polymarket resolution)..."):
-            hka = hko.fetch_station_temps("HKA")
+            hka = _load_station("HKA")
         with st.spinner("Fetching HKO Headquarters (comparison)..."):
             try:
-                hq = hko.fetch_station_temps("HKO")
+                hq = _load_station("HKO")
             except Exception:
                 hq = None
 
