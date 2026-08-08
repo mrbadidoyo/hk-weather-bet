@@ -862,28 +862,64 @@ elif page == "Bankroll":
     bc1, bc2 = st.columns(2)
     for col, temp_type in [(bc1, "high"), (bc2, "low")]:
         with col:
-            b = bias_report[temp_type]
+            # get_bias_report() returns {global: ..., by_range: ...}
+            report = bias_report.get(temp_type, {})
+            b = report.get("global", {})
             label = "HIGH Temperature" if temp_type == "high" else "LOW Temperature"
             st.markdown(f"### {label}")
 
-            if b["n_samples"] == 0:
+            n_samples = b.get("n_samples", 0)
+            if n_samples == 0:
                 st.info("No bias data yet. Will start learning after first resolved event.")
             else:
-                direction_emoji = "\u2b06\ufe0f" if b["mean_error"] > 0 else "\u2b07\ufe0f" if b["mean_error"] < 0 else "\u2705"
+                mean_error = float(b.get("mean_error", 0.0))
+                correction = float(b.get("correction", 0.0))
+                direction = b.get("direction", "calibrated")
+                confidence = b.get("confidence", "LOW")
+                direction_emoji = "⬆️" if mean_error > 0 else "⬇️" if mean_error < 0 else "✅"
+
                 c_b1, c_b2, c_b3 = st.columns(3)
-                c_b1.metric("Direction", f"{direction_emoji} {b['direction']}")
-                c_b2.metric("Mean Error", f"{b['mean_error']:+.2f}\u00b0C")
-                c_b3.metric("Correction", f"{b['correction']:+.2f}\u00b0C")
+                c_b1.metric("Direction", f"{direction_emoji} {direction}")
+                c_b2.metric("Mean Error", f"{mean_error:+.2f}°C")
+                c_b3.metric("Correction", f"{correction:+.2f}°C")
 
-                st.caption(f"Samples: {b['n_samples']} | EWMA: {b['ewma_error']:+.2f}\u00b0C | Confidence: {b['confidence']}")
+                # get_bias_report() does not expose ewma_error directly.
+                # Its correction value is the EWMA-based correction used by
+                # the bias corrector.
+                st.caption(
+                    f"Samples: {n_samples} | Correction: {correction:+.2f}°C | "
+                    f"Confidence: {confidence}"
+                )
 
-                # Visual indicator
-                if abs(b["correction"]) > 1.0:
+                if abs(correction) > 1.0:
                     st.warning("Large bias detected — model may need recalibration")
-                elif abs(b["correction"]) > 0.5:
+                elif abs(correction) > 0.5:
                     st.info("Moderate bias — correction being applied")
                 else:
                     st.success("Model well-calibrated")
+
+            # Range-aware learning details. get_bias_report() only returns
+            # ranges that have enough samples for range-specific learning.
+            range_stats = report.get("by_range", {})
+            if range_stats:
+                st.markdown("**Range Analysis**")
+                range_rows = []
+                for range_label, stats in range_stats.items():
+                    range_rows.append({
+                        "Temperature Range": range_label,
+                        "Direction": stats.get("direction", "calibrated"),
+                        "Mean Error": f"{float(stats.get('mean_error', 0.0)):+.2f}°C",
+                        "Correction": f"{float(stats.get('correction', 0.0)):+.2f}°C",
+                        "Samples": stats.get("n_samples", 0),
+                        "Confidence": stats.get("confidence", "LOW"),
+                    })
+                st.dataframe(
+                    pd.DataFrame(range_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.caption("No temperature range has enough samples yet for range-specific learning.")
 
     st.divider()
 
