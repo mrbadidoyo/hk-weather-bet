@@ -615,7 +615,47 @@ def format_message(target_date, predictions, market_prices, actual_temps):
     forecast = predictions.get("forecast", {})
     lines.append(f"High: {_format_temp_display(forecast.get('max_temp'))}")
     lines.append(f"Low : {_format_temp_display(forecast.get('min_temp'))}")
-    lines.extend(["", "Bias Correction", ""])
+
+    high_probs = predictions.get("high_probs", {})
+    low_probs = predictions.get("low_probs", {})
+    market_key_high = f"{date_str}_highest"
+    market_key_low = f"{date_str}_lowest"
+    market_high = market_prices.get(market_key_high, {}).get("prices", {})
+    market_low = market_prices.get(market_key_low, {}).get("prices", {})
+
+    def _leading_bucket(probs: dict, market_map: dict):
+        """Return (model_leader_label, model_prob, market_leader_label, market_price)."""
+        model_label, model_p = None, None
+        if probs:
+            model_label = max(probs, key=probs.get)
+            model_p = probs.get(model_label)
+        market_label, market_p = None, None
+        if market_map:
+            market_label = max(market_map, key=market_map.get)
+            market_p = market_map.get(market_label)
+        return model_label, model_p, market_label, market_p
+
+    lines.extend(["", "🏆 Leading Bucket", ""])
+    for side_name, probs, mkt in [
+        ("High", high_probs, market_high),
+        ("Low", low_probs, market_low),
+    ]:
+        m_lab, m_p, k_lab, k_p = _leading_bucket(probs, mkt)
+        if m_lab is not None:
+            lines.append(
+                f"{side_name} model : {_contract_label(m_lab)} ({m_p:.0%})"
+            )
+        else:
+            lines.append(f"{side_name} model : -")
+        if k_lab is not None:
+            lines.append(
+                f"{side_name} market: {_contract_label(k_lab)} ({k_p:.0%})"
+            )
+        else:
+            lines.append(f"{side_name} market: -")
+        lines.append("")
+
+    lines.extend(["Bias Correction", ""])
 
     bias_report = _get_bias_report()
     for side, label in [("high", "High"), ("low", "Low ")]:
@@ -629,13 +669,6 @@ def format_message(target_date, predictions, market_prices, actual_temps):
             lines.append(f"{label}: {corr:+.1f}°C")
     lines.append("")
     lines.append("━━━━━━━━━━━━━━")
-
-    high_probs = predictions.get("high_probs", {})
-    low_probs = predictions.get("low_probs", {})
-    market_key_high = f"{date_str}_highest"
-    market_key_low = f"{date_str}_lowest"
-    market_high = market_prices.get(market_key_high, {}).get("prices", {})
-    market_low = market_prices.get(market_key_low, {}).get("prices", {})
 
     best_bets = {"high": {"main": None, "lottery": None}, "low": {"main": None, "lottery": None}}
     if not is_resolved:
