@@ -12,7 +12,7 @@ from config import PROCESSED_DATA_DIR
 PERFORMANCE_LOG = PROCESSED_DATA_DIR / "model_performance.jsonl"
 
 
-def log_prediction(target_date, temp_type, bucket_probs, recommended_bets, actual_temp=None):
+def log_prediction(target_date, temp_type, bucket_probs, recommended_bets, actual_temp=None, provisional_result=None, provisional_market_price=None):
     """
     Log a prediction for later evaluation.
     
@@ -31,10 +31,61 @@ def log_prediction(target_date, temp_type, bucket_probs, recommended_bets, actua
         "recommended_bets": recommended_bets,
         "actual_temp": actual_temp,
         "resolved": actual_temp is not None,
+        "provisional_result": provisional_result,
+        "provisional_market_price": provisional_market_price,
+        "provisional_source": "polymarket_highest_price" if provisional_result is not None else None,
     }
     
     with open(PERFORMANCE_LOG, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
+
+
+def upsert_prediction(target_date, temp_type, bucket_probs, recommended_bets,
+                      provisional_result=None, provisional_market_price=None):
+    """Create or refresh the single unresolved prediction for a date/type."""
+    if not PERFORMANCE_LOG.exists():
+        log_prediction(target_date, temp_type, bucket_probs, recommended_bets,
+                       provisional_result=provisional_result,
+                       provisional_market_price=provisional_market_price)
+        return
+
+    raw = PERFORMANCE_LOG.read_text(encoding="utf-8").strip()
+    lines = raw.split("\n") if raw else []
+    updated = []
+    found = False
+    for line in lines:
+        if not line.strip():
+            continue
+        entry = json.loads(line)
+        if (not found and entry.get("target_date") == target_date
+                and entry.get("temp_type") == temp_type
+                and not entry.get("resolved", False)):
+            entry["timestamp"] = datetime.now().isoformat()
+            entry["bucket_probs"] = bucket_probs
+            entry["recommended_bets"] = recommended_bets
+            entry["provisional_result"] = provisional_result
+            entry["provisional_market_price"] = provisional_market_price
+            entry["provisional_source"] = ("polymarket_highest_price"
+                                            if provisional_result is not None else None)
+            found = True
+        updated.append(json.dumps(entry))
+
+    if not found:
+        updated.append(json.dumps({
+            "timestamp": datetime.now().isoformat(),
+            "target_date": target_date,
+            "temp_type": temp_type,
+            "bucket_probs": bucket_probs,
+            "recommended_bets": recommended_bets,
+            "actual_temp": None,
+            "resolved": False,
+            "provisional_result": provisional_result,
+            "provisional_market_price": provisional_market_price,
+            "provisional_source": ("polymarket_highest_price"
+                                    if provisional_result is not None else None),
+        }))
+
+    PERFORMANCE_LOG.write_text("\n".join(updated) + "\n", encoding="utf-8")
 
 
 def update_prediction(target_date, temp_type, actual_temp):

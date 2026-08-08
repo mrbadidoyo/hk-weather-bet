@@ -30,7 +30,7 @@ from config import (
 )
 from data_collector import HKODataCollector
 from polymarket_scraper import PolymarketScraper
-from model_tracker import log_prediction, update_prediction, get_performance_stats
+from model_tracker import log_prediction, update_prediction, upsert_prediction, get_performance_stats
 from bias_corrector import log_forecast_error, get_bias_correction, format_bias_summary
 
 logging.basicConfig(level=logging.WARNING)
@@ -295,6 +295,24 @@ def get_market_prices():
         }
 
     return market_data
+
+
+def get_market_leaders(market_prices, date_str):
+    """Return the highest-priced Polymarket integer temperature bucket per side."""
+    leaders = {}
+    for side, key_suffix in (("high", "highest"), ("low", "lowest")):
+        prices = market_prices.get(f"{date_str}_{key_suffix}", {}).get("prices", {}) or {}
+        if not prices:
+            leaders[side] = {"temperature": None, "label": None, "price": None}
+            continue
+        label, price = max(prices.items(), key=lambda item: float(item[1]))
+        match = re.search(r"(\d+)", str(label))
+        leaders[side] = {
+            "temperature": int(match.group(1)) if match else None,
+            "label": label,
+            "price": float(price),
+        }
+    return leaders
 
 
 def check_if_resolved(market_prices, date_str):
@@ -947,6 +965,8 @@ def build_prediction_snapshot(
     market_prices,
     high_bucket_defs,
     low_bucket_defs,
+    provisional_high=None,
+    provisional_low=None,
 ):
     """Build a structured snapshot from existing prediction outputs."""
     try:
@@ -1068,6 +1088,11 @@ def build_prediction_snapshot(
         "timestamp": generated_at.isoformat(),
         "target_date": date_str,
         "status": status,
+        "provisional": {
+            "high": provisional_high,
+            "low": provisional_low,
+            "source": "polymarket_highest_price" if (provisional_high is not None or provisional_low is not None) else None,
+        },
         "forecast": {
             "high": forecast_high,
             "low": forecast_low,
@@ -1242,11 +1267,23 @@ def run(target_dates=None):
         print(f"\n[4/7] Checking if event is resolved...")
         actual_max, actual_min = get_actual_temperature(target_date)
         if actual_max is not None:
-            print(f"  RESOLVED: High {actual_max}°C, Low {actual_min}°C")
+            actual_max = int(round(float(actual_max)))
             update_prediction(date_str, "high", actual_max)
-            update_prediction(date_str, "low", actual_min)
+            print(f"  HIGH RESOLVED: {actual_max}°C")
         else:
-            print(f"  Event not yet resolved\n")
+            print("  HIGH still pending")
+
+        if actual_min is not None:
+            actual_min = int(round(float(actual_min)))
+            update_prediction(date_str, "low", actual_min)
+            print(f"  LOW RESOLVED: {actual_min}°C")
+        else:
+            print("  LOW still pending")
+
+        if actual_max is None and actual_min is None:
+            print("  Event not yet resolved")
+
+        market_leaders = get_market_leaders(market_prices, date_str)
 
         # Extract dynamic bucket ranges for this date
         print("[6/7] Extracting dynamic bucket ranges...")
@@ -1332,12 +1369,19 @@ def run(target_dates=None):
         print(f"    Low: {best_low} ({low_probs[best_low]:.0%})")
 
         # Format message with date label
-        actual_temps = (actual_max, actual_min) if actual_max is not None else None
+        actual_temps = (actual_max, actual_min) if (actual_max is not None or actual_min is not None) else None
         message = format_message(target_date, predictions, market_prices, actual_temps)
+
+        if actual_max is not None and actual_min is not None:
+            snapshot_status = "RESOLVED"
+        elif actual_max is not None or actual_min is not None:
+            snapshot_status = "PARTIALLY RESOLVED"
+        else:
+            snapshot_status = "PROVISIONAL" if (market_leaders["high"]["temperature"] is not None or market_leaders["low"]["temperature"] is not None) else "PENDING"
 
         snapshot = build_prediction_snapshot(
             target_date=target_date,
-            status="RESOLVED" if actual_max is not None else "PENDING",
+            status=snapshot_status,
             forecast_high=max_fc,
             forecast_low=min_fc,
             bias_high=bias_high,
@@ -1346,16 +1390,30 @@ def run(target_dates=None):
             market_prices=market_prices,
             high_bucket_defs=high_bucket_defs,
             low_bucket_defs=low_bucket_defs,
+            provisional_high=market_leaders["high"],
+            provisional_low=market_leaders["low"],
         )
         save_prediction_snapshot(snapshot)
         print(f"  [OK] Snapshot saved: {snapshot['snapshot_id']}")
         
-        # Log predictions
+        # Log/refresh HIGH and LOW independently. Provisional result is the
+        # integer temperature bucket with the highest Polymarket price.
+        best_bets = find_recommended_bets(predictions, market_prices, date_str)
+
         if actual_max is None:
-            best_bets = find_recommended_bets(predictions, market_prices, date_str)
-            log_prediction(date_str, "high", high_probs, best_bets.get("high", {}))
-            log_prediction(date_str, "low", low_probs, best_bets.get("low", {}))
-            print("\n  [OK] Predictions logged for performance tracking")
+            leader = market_leaders["high"]
+            upsert_prediction(date_str, "high", high_probs, best_bets.get("high", {}),
+                              provisional_result=leader.get("temperature"),
+                              provisional_market_price=leader.get("price"))
+
+        if actual_min is None:
+            leader = market_leaders["low"]
+            upsert_prediction(date_str, "low", low_probs, best_bets.get("low", {}),
+                              provisional_result=leader.get("temperature"),
+                              provisional_market_price=leader.get("price"))
+
+        if actual_max is None or actual_min is None:
+            print("\n  [OK] Pending predictions refreshed with current market leader")
 
             alert_lines = []
             hour_key = datetime.now().strftime("%Y-%m-%d-%H")
@@ -1384,8 +1442,10 @@ def run(target_dates=None):
         
         if actual_max is not None:
             log_forecast_error(date_str, "high", high_mean, actual_max)
+            print("  [OK] HIGH forecast error logged for bias correction")
+        if actual_min is not None:
             log_forecast_error(date_str, "low", low_mean, actual_min)
-            print("  [OK] Forecast errors logged for bias correction")
+            print("  [OK] LOW forecast error logged for bias correction")
 
         try:
             print(f"\n--- Message Preview ({date_str}) ---")
