@@ -32,7 +32,25 @@ from polymarket_strategy import (
 )
 from utils import get_bucket_probs, compute_historical_std
 
+import csv
+
 logging.basicConfig(level=logging.WARNING)
+
+# Prediction logging helper
+def append_prediction_logs(entries: list[dict]):
+    """Append multiple prediction entries to CSV log."""
+    if not entries:
+        return
+    log_path = Path(__file__).parent / "logs" / "predictions.csv"
+    log_path.parent.mkdir(exist_ok=True)
+    file_exists = log_path.is_file()
+    with open(log_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=entries[0].keys())
+        if not file_exists:
+            writer.writeheader()
+        for entry in entries:
+            writer.writerow(entry)
+
 
 st.set_page_config(
     page_title="HK Weather Bet",
@@ -407,6 +425,7 @@ if page == "Dashboard":
     low_buckets = parse_buckets(DEFAULT_LOW_TEMP_BUCKETS)
 
     rows = []
+    log_entries = []
     for day in wf:
         date_str = day.get("forecastDate", "")
         try:
@@ -433,6 +452,24 @@ if page == "Dashboard":
         min_q75 = min_t + q75_min
         min_q90 = min_t + q90_min
 
+        # Log prediction for this day
+        log_entries.append({
+            "forecast_date": f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}",
+            "prediction_run_timestamp": forecast_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "predicted_max": max_t,
+            "predicted_min": min_t,
+            "max_q10": max_q10,
+            "max_q25": max_q25,
+            "max_q50": max_q50,
+            "max_q75": max_q75,
+            "max_q90": max_q90,
+            "min_q10": min_q10,
+            "min_q25": min_q25,
+            "min_q50": min_q50,
+            "min_q75": min_q75,
+            "min_q90": min_q90,
+        })
+
         # Compute probabilities using quantile-based approach
         high_probs = bucket_probs_from_quantiles(
             [(b.label, b.lower, b.upper) for b in high_buckets],
@@ -455,6 +492,9 @@ if page == "Dashboard":
             "Most Likely Low": f"{best_low} ({low_probs[best_low]:.0%})",
             "Weather": weather,
         })
+
+    # Log predictions for the 9-day forecast
+    append_prediction_logs(log_entries)
 
     forecast_df = pd.DataFrame(rows)
     st.dataframe(forecast_df, use_container_width=True, hide_index=True)
