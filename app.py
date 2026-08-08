@@ -684,12 +684,23 @@ elif page == "Betting Analysis":
     # st.write("High best bet:", high_analysis.best_bet.bucket_label if high_analysis.best_bet else None)
     # st.write("High bucket labels:", list(df_high['Bucket']))
     if high_analysis.best_bet:
-        def highlight_best(s):
-            # s is a Series (row)
-            return ['background-color: #fff9c4' if s['Bucket'] == high_analysis.best_bet.bucket_label else '' for _ in s]
-        styled = df_high.style.apply(highlight_best, axis=1)
-        html = styled.to_html()
-        st.markdown(html, unsafe_allow_html=True)
+        best_label = high_analysis.best_bet.bucket_label
+        # Build HTML table with inline highlighting
+        html = ['<table style="width:100%; border-collapse:collapse;">']
+        # Header
+        html.append('<thead><tr>')
+        for col in df_high.columns:
+            html.append(f'<th style="border:1px solid #ddd; padding:8px; text-align:left; background-color:#f2f2f2;">{col}</th>')
+        html.append('</tr></thead><tbody>')
+        # Rows
+        for _, row in df_high.iterrows():
+            bg = '#fff9c4' if row['Bucket'] == best_label else 'white'
+            html.append(f'<tr style="background-color:{bg};">')
+            for val in row:
+                html.append(f'<td style="border:1px solid #ddd; padding:8px;">{val}</td>')
+            html.append('</tr>')
+        html.append('</tbody></table>')
+        st.markdown(''.join(html), unsafe_allow_html=True)
     else:
         st.dataframe(df_high, use_container_width=True, hide_index=True)
 
@@ -764,11 +775,23 @@ elif page == "Betting Analysis":
     # st.write("Low best bet:", low_analysis.best_bet.bucket_label if low_analysis.best_bet else None)
     # st.write("Low bucket labels:", list(df_low['Bucket']))
     if low_analysis.best_bet:
-        def highlight_best(s):
-            return ['background-color: #fff9c4' if s['Bucket'] == low_analysis.best_bet.bucket_label else '' for _ in s]
-        styled = df_low.style.apply(highlight_best, axis=1)
-        html = styled.to_html()
-        st.markdown(html, unsafe_allow_html=True)
+        best_label = low_analysis.best_bet.bucket_label
+        # Build HTML table with inline highlighting
+        html = ['<table style="width:100%; border-collapse:collapse;">']
+        # Header
+        html.append('<thead><tr>')
+        for col in df_low.columns:
+            html.append(f'<th style="border:1px solid #ddd; padding:8px; text-align:left; background-color:#f2f2f2;">{col}</th>')
+        html.append('</tr></thead><tbody>')
+        # Rows
+        for _, row in df_low.iterrows():
+            bg = '#fff9c4' if row['Bucket'] == best_label else 'white'
+            html.append(f'<tr style="background-color:{bg};">')
+            for val in row:
+                html.append(f'<td style="border:1px solid #ddd; padding:8px;">{val}</td>')
+            html.append('</tr>')
+        html.append('</tbody></table>')
+        st.markdown(''.join(html), unsafe_allow_html=True)
     else:
         st.dataframe(df_low, use_container_width=True, hide_index=True)
 
