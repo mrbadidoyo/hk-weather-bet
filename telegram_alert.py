@@ -315,40 +315,29 @@ def check_if_resolved(market_prices, date_str):
 def extract_dynamic_buckets(market_prices, date_str, temp_type):
     """
     Extract actual bucket definitions from Polymarket market data.
-    Buckets shift per day based on expected temperatures.
-    
+    Uses shared parser from polymarket_strategy (handles "32°C",
+    "27°C or below", "37°C or higher", ranges, etc.).
+
     Returns list of (label, lo, hi) tuples.
     """
+    from polymarket_strategy import buckets_from_labels
+
     key = f"{date_str}_{temp_type}"
+    fallback = (
+        DEFAULT_HIGH_TEMP_BUCKETS
+        if temp_type == "highest"
+        else DEFAULT_LOW_TEMP_BUCKETS
+    )
+
     if key not in market_prices:
-        # Fallback to default buckets
-        return DEFAULT_HIGH_TEMP_BUCKETS if temp_type == "highest" else DEFAULT_LOW_TEMP_BUCKETS
-    
-    prices = market_prices[key]["prices"]
-    buckets = []
-    
-    for bucket_label in prices.keys():
-        # Parse bucket label like "34°C", "27°C or below", "37°C or higher"
-        match = re.search(r'(\d+)', bucket_label)
-        if not match:
-            continue
-        
-        temp = int(match.group(1))
-        
-        if "below" in bucket_label.lower():
-            # "27°C or below" → (-999, 28)
-            buckets.append((bucket_label, -999, temp + 1))
-        elif "higher" in bucket_label.lower():
-            # "37°C or higher" → (37, 999)
-            buckets.append((bucket_label, temp, 999))
-        else:
-            # "34°C" → (34, 35)
-            buckets.append((bucket_label, temp, temp + 1))
-    
-    # Sort by lower bound
-    buckets.sort(key=lambda x: x[1])
-    
-    return buckets if buckets else (DEFAULT_HIGH_TEMP_BUCKETS if temp_type == "highest" else DEFAULT_LOW_TEMP_BUCKETS)
+        return fallback
+
+    prices = market_prices[key].get("prices", {})
+    if not prices:
+        return fallback
+
+    buckets = buckets_from_labels(list(prices.keys()))
+    return buckets if buckets else fallback
 
 
 # ── Improvement #3: Kelly Criterion ──────────────────────────────
@@ -528,13 +517,37 @@ def format_message(target_date, predictions, market_prices, actual_temps):
         return f"Model {model_prob:.0%} | Market {market_prob:.0%}"
 
     def _get_bias_report():
+        """Normalize bias report to a flat shape used by the Telegram message."""
         try:
             from bias_corrector import get_bias_report
-            return get_bias_report()
+            raw = get_bias_report()
+            out = {}
+            for side in ("high", "low"):
+                side_data = raw.get(side, {})
+                # New format: {"global": {...}, "by_range": {...}}
+                if isinstance(side_data, dict) and "global" in side_data:
+                    g = side_data.get("global", {})
+                    out[side] = {
+                        "correction": g.get("correction", 0.0),
+                        "n_samples": g.get("n_samples", 0),
+                        "confidence": g.get("confidence", "LOW"),
+                        "direction": g.get("direction", "calibrated"),
+                        "by_range": side_data.get("by_range", {}),
+                    }
+                else:
+                    # Old flat format fallback
+                    out[side] = {
+                        "correction": side_data.get("correction", 0.0),
+                        "n_samples": side_data.get("n_samples", 0),
+                        "confidence": side_data.get("confidence", "LOW"),
+                        "direction": side_data.get("direction", "calibrated"),
+                        "by_range": {},
+                    }
+            return out
         except Exception:
             return {
-                "high": {"correction": 0.0, "n_samples": 0},
-                "low": {"correction": 0.0, "n_samples": 0},
+                "high": {"correction": 0.0, "n_samples": 0, "by_range": {}},
+                "low": {"correction": 0.0, "n_samples": 0, "by_range": {}},
             }
 
     def _market_price_for_label(label, market_map):
@@ -600,8 +613,15 @@ def format_message(target_date, predictions, market_prices, actual_temps):
     lines.extend(["", "Bias Correction", ""])
 
     bias_report = _get_bias_report()
-    lines.append(f"High: {bias_report.get('high', {}).get('correction', 0.0):+,.1f}°C".replace(",", ""))
-    lines.append(f"Low : {bias_report.get('low', {}).get('correction', 0.0):+,.1f}°C".replace(",", ""))
+    for side, label in [("high", "High"), ("low", "Low ")]:
+        b = bias_report.get(side, {})
+        corr = b.get("correction", 0.0)
+        n = b.get("n_samples", 0)
+        conf = b.get("confidence", "")
+        if n > 0:
+            lines.append(f"{label}: {corr:+.1f}°C (n={n}, {conf})")
+        else:
+            lines.append(f"{label}: {corr:+.1f}°C")
     lines.append("")
     lines.append("━━━━━━━━━━━━━━")
 
@@ -1269,17 +1289,28 @@ def run(target_dates=None):
             min_fc = None
             print(f"  No forecast available for {date_str}")
 
-        # Apply bias correction
-        print("\n  Applying bias correction...")
-        bias_high = get_bias_correction("high")
-        bias_low = get_bias_correction("low")
-        if max_fc is not None and bias_high["n_samples"] > 0:
-            max_fc += bias_high["correction"]
-            print(f"  HIGH correction: {bias_high['correction']:+.2f}°C (n={bias_high['n_samples']}, {bias_high['confidence']})")
-        if min_fc is not None and bias_low["n_samples"] > 0:
-            min_fc += bias_low["correction"]
-            print(f"  LOW correction: {bias_low['correction']:+.2f}°C (n={bias_low['n_samples']}, {bias_low['confidence']})")
-        if bias_high["n_samples"] == 0 and bias_low["n_samples"] == 0:
+        # Apply range-aware bias correction (uses predicted_mean to pick the band)
+        print("\n  Applying bias correction (range-aware)...")
+        bias_high = get_bias_correction("high", predicted_mean=max_fc if max_fc is not None else None)
+        bias_low = get_bias_correction("low", predicted_mean=min_fc if min_fc is not None else None)
+
+        if max_fc is not None and bias_high.get("n_samples", 0) > 0:
+            max_fc = float(max_fc) + bias_high["correction"]
+            src = bias_high.get("source", "global")
+            rng = bias_high.get("range_label") or "-"
+            print(
+                f"  HIGH correction: {bias_high['correction']:+.2f}°C "
+                f"(source={src}, range={rng}, n={bias_high['n_samples']}, {bias_high['confidence']})"
+            )
+        if min_fc is not None and bias_low.get("n_samples", 0) > 0:
+            min_fc = float(min_fc) + bias_low["correction"]
+            src = bias_low.get("source", "global")
+            rng = bias_low.get("range_label") or "-"
+            print(
+                f"  LOW correction: {bias_low['correction']:+.2f}°C "
+                f"(source={src}, range={rng}, n={bias_low['n_samples']}, {bias_low['confidence']})"
+            )
+        if bias_high.get("n_samples", 0) == 0 and bias_low.get("n_samples", 0) == 0:
             print("  No bias data yet (will start learning after first resolved event)")
         
         # Predict high temp buckets
