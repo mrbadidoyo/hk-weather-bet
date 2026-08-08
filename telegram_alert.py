@@ -600,7 +600,12 @@ def format_message(target_date, predictions, market_prices, actual_temps):
             return "🟢 UNDERPRICED"
         return "🔴 OVERPRICED"
 
-    lines = ["🌡️ HK WEATHER ALERT", "", f"Generated:", now, "", f"📅 Target: {date_str}"]
+    lines = [
+        "🌡️ HK WEATHER ALERT",
+        "",
+        f"🕒 Generated: {now}",
+        f"📅 Target: {date_str}",
+    ]
 
     is_resolved, _ = check_if_resolved(market_prices, date_str)
     status = "RESOLVED" if is_resolved and actual_temps else "PENDING"
