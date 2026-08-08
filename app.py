@@ -1,6 +1,7 @@
 """
 HK Weather Prediction Dashboard - Streamlit GUI
 """
+# Revision note: dashboard behavior preserved; revision marker only.
 import sys
 from pathlib import Path
 
