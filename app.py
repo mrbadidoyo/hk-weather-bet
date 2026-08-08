@@ -640,6 +640,19 @@ elif page == "Betting Analysis":
     # ── Summary ─────────────────────────────────────────────────────
     st.divider()
     st.markdown("### Quick Summary")
+
+    def _pricing_status(edge: float) -> str:
+        """Label market vs model probability."""
+        try:
+            e = float(edge)
+        except (TypeError, ValueError):
+            return "⚪ FAIR VALUE"
+        if abs(e) < 0.01:
+            return "⚪ FAIR VALUE"
+        if e > 0:
+            return "🟢 UNDERPRICED"
+        return "🔴 OVERPRICED"
+
     sc1, sc2 = st.columns(2)
 
     high_event_url = build_polymarket_event_url(date_iso, "highest")
@@ -648,12 +661,14 @@ elif page == "Betting Analysis":
     with sc1:
         if high_analysis.best_bet:
             bb = high_analysis.best_bet
+            status = _pricing_status(bb.edge)
             st.metric(
                 "High Temp Best Bet",
                 bb.bucket_label,
                 delta=f"{bb.edge:+.1%} edge",
             )
             st.markdown(
+                f"**Status:** {status}  \n"
                 f"**Action:** BUY YES `{bb.bucket_label}`  \n"
                 f"Model {bb.model_prob:.0%} · Market {bb.market_price:.0%} · "
                 f"Kelly {bb.kelly_fraction:.1%}  \n"
@@ -666,12 +681,14 @@ elif page == "Betting Analysis":
     with sc2:
         if low_analysis.best_bet:
             bb = low_analysis.best_bet
+            status = _pricing_status(bb.edge)
             st.metric(
                 "Low Temp Best Bet",
                 bb.bucket_label,
                 delta=f"{bb.edge:+.1%} edge",
             )
             st.markdown(
+                f"**Status:** {status}  \n"
                 f"**Action:** BUY YES `{bb.bucket_label}`  \n"
                 f"Model {bb.model_prob:.0%} · Market {bb.market_price:.0%} · "
                 f"Kelly {bb.kelly_fraction:.1%}  \n"
