@@ -132,6 +132,32 @@ def map_live_prices_to_defaults(live_prices: dict, default_buckets: list) -> dic
     return mapped
 
 
+def build_polymarket_event_url(date_iso: str, temp_type: str) -> str:
+    """
+    Build Polymarket event URL for HK temperature market.
+
+    temp_type: 'highest' or 'lowest' (also accepts 'high' / 'low')
+    """
+    MONTHS = [
+        "january", "february", "march", "april", "may", "june",
+        "july", "august", "september", "october", "november", "december",
+    ]
+    t = temp_type.lower()
+    if t in ("high", "max"):
+        t = "highest"
+    elif t in ("low", "min"):
+        t = "lowest"
+
+    try:
+        dt = datetime.strptime(date_iso, "%Y-%m-%d")
+    except ValueError:
+        return "https://polymarket.com/"
+
+    month_name = MONTHS[dt.month - 1]
+    slug = f"{t}-temperature-in-hong-kong-on-{month_name}-{dt.day}-{dt.year}"
+    return f"https://polymarket.com/event/{slug}"
+
+
 def fetch_live_polymarket_prices(date_iso: str, days_ahead: int = 10) -> dict:
     """
     Fetch live Polymarket prices for a given date.
@@ -140,8 +166,10 @@ def fetch_live_polymarket_prices(date_iso: str, days_ahead: int = 10) -> dict:
         {
           "high": {bucket_label: price, ...},
           "low":  {bucket_label: price, ...},
-          "raw_high": {...},  # original labels from API
+          "raw_high": {...},
           "raw_low": {...},
+          "slug_high": str | None,
+          "slug_low": str | None,
           "events_found": int,
         }
     """
@@ -155,6 +183,8 @@ def fetch_live_polymarket_prices(date_iso: str, days_ahead: int = 10) -> dict:
         "low": {},
         "raw_high": {},
         "raw_low": {},
+        "slug_high": None,
+        "slug_low": None,
         "events_found": len(events),
     }
 
@@ -164,13 +194,16 @@ def fetch_live_polymarket_prices(date_iso: str, days_ahead: int = 10) -> dict:
         snap = scraper.get_market_snapshot(event)
         prices = snap.get("prices") or {}
         etype = (snap.get("type") or event.get("_type") or "").lower()
+        slug = snap.get("slug") or event.get("_slug")
 
         if etype == "highest":
             result["raw_high"] = prices
             result["high"] = map_live_prices_to_defaults(prices, DEFAULT_HIGH_TEMP_BUCKETS)
+            result["slug_high"] = slug
         elif etype == "lowest":
             result["raw_low"] = prices
             result["low"] = map_live_prices_to_defaults(prices, DEFAULT_LOW_TEMP_BUCKETS)
+            result["slug_low"] = slug
 
     return result
 
@@ -608,18 +641,45 @@ elif page == "Betting Analysis":
     st.divider()
     st.markdown("### Quick Summary")
     sc1, sc2 = st.columns(2)
+
+    high_event_url = build_polymarket_event_url(date_iso, "highest")
+    low_event_url = build_polymarket_event_url(date_iso, "lowest")
+
     with sc1:
         if high_analysis.best_bet:
-            st.metric("High Temp Best Bet", high_analysis.best_bet.bucket_label,
-                       delta=f"{high_analysis.best_bet.edge:+.1%} edge")
+            bb = high_analysis.best_bet
+            st.metric(
+                "High Temp Best Bet",
+                bb.bucket_label,
+                delta=f"{bb.edge:+.1%} edge",
+            )
+            st.markdown(
+                f"**Action:** BUY YES `{bb.bucket_label}`  \n"
+                f"Model {bb.model_prob:.0%} · Market {bb.market_price:.0%} · "
+                f"Kelly {bb.kelly_fraction:.1%}  \n"
+                f"🔗 [Open High Temp event]({high_event_url})"
+            )
         else:
             st.metric("High Temp", "No +EV bets")
+            st.markdown(f"🔗 [Open High Temp event]({high_event_url})")
+
     with sc2:
         if low_analysis.best_bet:
-            st.metric("Low Temp Best Bet", low_analysis.best_bet.bucket_label,
-                       delta=f"{low_analysis.best_bet.edge:+.1%} edge")
+            bb = low_analysis.best_bet
+            st.metric(
+                "Low Temp Best Bet",
+                bb.bucket_label,
+                delta=f"{bb.edge:+.1%} edge",
+            )
+            st.markdown(
+                f"**Action:** BUY YES `{bb.bucket_label}`  \n"
+                f"Model {bb.model_prob:.0%} · Market {bb.market_price:.0%} · "
+                f"Kelly {bb.kelly_fraction:.1%}  \n"
+                f"🔗 [Open Low Temp event]({low_event_url})"
+            )
         else:
             st.metric("Low Temp", "No +EV bets")
+            st.markdown(f"🔗 [Open Low Temp event]({low_event_url})")
 
 
 # ====================================================================
