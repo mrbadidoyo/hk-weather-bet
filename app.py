@@ -685,7 +685,8 @@ elif page == "Betting Analysis":
             # s is a Series (row)
             return ['background-color: #fff9c4' if s['Bucket'] == high_analysis.best_bet.bucket_label else '' for _ in s]
         styled = df_high.style.apply(highlight_best, axis=1)
-        st.dataframe(styled, use_container_width=True, hide_index=True)
+        html = styled.to_html()
+        st.markdown(html, unsafe_allow_html=True)
     else:
         st.dataframe(df_high, use_container_width=True, hide_index=True)
 
@@ -760,7 +761,8 @@ elif page == "Betting Analysis":
         def highlight_best(s):
             return ['background-color: #fff9c4' if s['Bucket'] == low_analysis.best_bet.bucket_label else '' for _ in s]
         styled = df_low.style.apply(highlight_best, axis=1)
-        st.dataframe(styled, use_container_width=True, hide_index=True)
+        html = styled.to_html()
+        st.markdown(html, unsafe_allow_html=True)
     else:
         st.dataframe(df_low, use_container_width=True, hide_index=True)
 
